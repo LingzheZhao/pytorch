@@ -7042,7 +7042,6 @@ class TestSDPAAccelerator(NNTestCase):
     @parametrize("expand_q_num_heads", [True, False])
     @parametrize("expand_k_num_heads", [True, False])
     @parametrize("expand_v_num_heads", [True, False])
-    @skipIfXpu(msg="XPU SDPA dispatch lacks nested broadcasting kernels; tracked in torch-xpu-ops")
     def test_fused_kernels_nested_broadcasting(
         self,
         device,
@@ -7054,6 +7053,8 @@ class TestSDPAAccelerator(NNTestCase):
         expand_k_num_heads,
         expand_v_num_heads,
     ):
+        if torch.device(device).type == "xpu" and kernel == SDPBackend.FLASH_ATTENTION:
+            self.skipTest("XPU flash attention has no nested kernel; tracked in torch-xpu-ops")
         is_efficient = kernel == SDPBackend.EFFICIENT_ATTENTION
         dtype = torch.float32 if is_efficient else torch.float16
         rand_nested_tensor = partial(rand_sdpa_tensor, type="nested", device=device, dtype=dtype)
