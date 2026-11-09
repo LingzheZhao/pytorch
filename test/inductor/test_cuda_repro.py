@@ -52,6 +52,7 @@ from torch.testing._internal.common_utils import (
     TEST_WITH_ASAN,
     TEST_WITH_ROCM,
     TEST_XPU,
+    xfailIf,
     xfailIfROCm,
 )
 from torch.testing._internal.inductor_utils import (
@@ -3907,7 +3908,8 @@ def triton_poi_fused_add_reflection_pad2d_0(in_ptr0, in_ptr1, out_ptr0, xnumel, 
 
                 self.assertEqual(eager_div, compiled_div)
 
-    @skipIfXpu(msg="triton dependency - torch-xpu-ops: 2554")
+    # XPU compiled truediv is bitwise equal to eager.
+    @xfailIf(TEST_XPU)
     @config.patch({"eager_numerics.division_rounding": False})
     @xfailIfROCm
     def test_truediv_base_not_bitwise_equivalent(self):
