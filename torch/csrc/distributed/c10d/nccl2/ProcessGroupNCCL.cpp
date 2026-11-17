@@ -760,7 +760,9 @@ void ProcessGroupNCCL::handleBlockingWaitFailure(
     WorkNCCL::WorkStatus status,
     int64_t reconfigure_uuid) {
   std::lock_guard reconfigureLock(reconfigure_mutex_);
-  if (reconfigure_uuid_ != reconfigure_uuid) {
+  // A reconfigure() in progress is tearing this communicator down anyway.
+  if (reconfigure_uuid_ != reconfigure_uuid ||
+      reconfiguring_.load(std::memory_order_acquire)) {
     return;
   }
   comm_state_ = status == WorkNCCL::WorkStatus::TIMEDOUT ? CommState::TIMEOUT
@@ -823,7 +825,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::sendImpl(
     int dst,
     bool async_op,
     std::chrono::milliseconds timeout) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
   checkTensorDevice(tensor);
@@ -833,8 +835,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::sendImpl(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op ? createWork(stream, timeout, tensor)
-                       : createWork(stream, timeout);
+  auto work = async_op ? createWork(reconfigureCount, stream, timeout, tensor)
+                       : createWork(reconfigureCount, stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("send");
@@ -882,7 +884,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::recvImpl(
     int src,
     bool async_op,
     std::chrono::milliseconds timeout) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
   checkTensorDevice(tensor);
@@ -892,7 +894,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::recvImpl(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = createWork(stream, timeout);
+  auto work = createWork(reconfigureCount, stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("recv");
@@ -936,7 +938,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::batch_op_issue(
     const std::vector<BatchSendRecv::P2POp>& ops,
     bool async_op,
     std::chrono::milliseconds timeout) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   TORCH_CHECK(!ops.empty(), "Cannot issue empty batch operation");
 
@@ -970,7 +972,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::batch_op_issue(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = createWork(stream, timeout, input_tensors);
+  auto work = createWork(reconfigureCount, stream, timeout, input_tensors);
 
   // Record start event before NCCL operations
   work->recordStart("batch_op_issue");
@@ -1032,7 +1034,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::broadcastImpl(
     bool async_op,
     std::chrono::milliseconds timeout,
     const MaterializedCollectiveConfig& native_config) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
   checkTensorDevice(tensor);
@@ -1043,8 +1045,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::broadcastImpl(
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
 
-  auto work = async_op ? createWork(stream, timeout, tensor)
-                       : createWork(stream, timeout);
+  auto work = async_op ? createWork(reconfigureCount, stream, timeout, tensor)
+                       : createWork(reconfigureCount, stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("broadcast");
@@ -1076,7 +1078,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_reduce(
     bool async_op,
     std::chrono::milliseconds timeout,
     const MaterializedCollectiveConfig& native_config) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
   checkTensorDevice(tensor);
@@ -1086,8 +1088,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_reduce(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op ? createWork(stream, timeout, tensor)
-                       : createWork(stream, timeout);
+  auto work = async_op ? createWork(reconfigureCount, stream, timeout, tensor)
+                       : createWork(reconfigureCount, stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("all_reduce");
@@ -1122,7 +1124,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::reduceImpl(
     bool async_op,
     std::chrono::milliseconds timeout,
     const MaterializedCollectiveConfig& native_config) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
   checkTensorDevice(tensor);
@@ -1132,8 +1134,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::reduceImpl(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op ? createWork(stream, timeout, tensor)
-                       : createWork(stream, timeout);
+  auto work = async_op ? createWork(reconfigureCount, stream, timeout, tensor)
+                       : createWork(reconfigureCount, stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("reduce");
@@ -1168,7 +1170,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_gather(
     bool async_op,
     std::chrono::milliseconds timeout,
     const MaterializedCollectiveConfig& native_config) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   TORCH_CHECK(
       tensor_list.size() == static_cast<size_t>(comm_size_),
@@ -1224,8 +1226,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_gather(
           local_outputs[i].storage().data_ptr(), operation_stream);
     }
   }
-  auto work = async_op ? createWork(stream, timeout, tensor)
-                       : createWork(stream, timeout);
+  auto work = async_op ? createWork(reconfigureCount, stream, timeout, tensor)
+                       : createWork(reconfigureCount, stream, timeout);
 
   work->recordStart("all_gather");
 
@@ -1280,7 +1282,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::allGatherSingleImpl(
     bool async_op,
     std::chrono::milliseconds timeout,
     const MaterializedCollectiveConfig& native_config) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output);
   ensureTensorContiguous(input);
@@ -1303,8 +1305,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::allGatherSingleImpl(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op ? createWork(stream, timeout, input)
-                       : createWork(stream, timeout);
+  auto work = async_op ? createWork(reconfigureCount, stream, timeout, input)
+                       : createWork(reconfigureCount, stream, timeout);
 
   work->recordStart("allGatherSingleImpl");
 
@@ -1335,7 +1337,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::reduce_scatter(
     bool async_op,
     std::chrono::milliseconds timeout,
     const MaterializedCollectiveConfig& native_config) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output);
 
@@ -1366,8 +1368,9 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::reduce_scatter(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op ? createWork(stream, timeout, input_list)
-                       : createWork(stream, timeout);
+  auto work = async_op
+      ? createWork(reconfigureCount, stream, timeout, input_list)
+      : createWork(reconfigureCount, stream, timeout);
 
   work->recordStart("reduce_scatter");
 
@@ -1434,7 +1437,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::reduceScatterSingleImpl(
     bool async_op,
     std::chrono::milliseconds timeout,
     const MaterializedCollectiveConfig& native_config) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output);
   ensureTensorContiguous(input);
@@ -1457,8 +1460,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::reduceScatterSingleImpl(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op ? createWork(stream, timeout, input)
-                       : createWork(stream, timeout);
+  auto work = async_op ? createWork(reconfigureCount, stream, timeout, input)
+                       : createWork(reconfigureCount, stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("reduceScatterSingleImpl");
@@ -1492,7 +1495,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::allToAllSingleImpl(
     bool async_op,
     std::chrono::milliseconds timeout,
     const MaterializedCollectiveConfig& native_config) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output);
   ensureTensorContiguous(input);
@@ -1519,8 +1522,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::allToAllSingleImpl(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op ? createWork(stream, timeout, input)
-                       : createWork(stream, timeout);
+  auto work = async_op ? createWork(reconfigureCount, stream, timeout, input)
+                       : createWork(reconfigureCount, stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("allToAllSingleImpl");
@@ -1589,7 +1592,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_to_all_v_single(
     const std::vector<uint64_t>& input_split_sizes,
     bool async_op,
     std::chrono::milliseconds timeout) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output);
   ensureTensorContiguous(input);
@@ -1633,8 +1636,8 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_to_all_v_single(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op ? createWork(stream, timeout, input)
-                       : createWork(stream, timeout);
+  auto work = async_op ? createWork(reconfigureCount, stream, timeout, input)
+                       : createWork(reconfigureCount, stream, timeout);
 
   // Record start event before NCCL operation
   work->recordStart("all_to_all_v_single");
@@ -1719,7 +1722,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_to_all(
     const std::vector<at::Tensor>& input_tensor_list,
     bool async_op,
     std::chrono::milliseconds timeout) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   checkTensorsDevice(output_tensor_list);
   checkTensorsDevice(input_tensor_list);
@@ -1747,8 +1750,9 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_to_all(
 
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = async_op ? createWork(stream, timeout, input_tensor_list)
-                       : createWork(stream, timeout);
+  auto work = async_op
+      ? createWork(reconfigureCount, stream, timeout, input_tensor_list)
+      : createWork(reconfigureCount, stream, timeout);
 
   // Record start event before NCCL operations
   work->recordStart("all_to_all");
@@ -1803,7 +1807,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::all_to_all(
 c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::barrierImpl(
     bool async_op,
     std::chrono::milliseconds timeout) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
 
   // Allocated here rather than in initNcclResources() so that merely creating a
@@ -1824,7 +1828,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::barrierImpl(
       name_, comm_size_, "barrier", rank_, sequence_number_);
   c10::cuda::CUDAGuard device_guard(device_);
   cudaStream_t stream = getOperationStream(async_op);
-  auto work = createWork(stream, timeout);
+  auto work = createWork(reconfigureCount, stream, timeout);
 
   // A synchronous barrier host-blocks the CPU thread in synchronizeInternal(),
   // matching stock ProcessGroupNCCL; async barriers stay stream-ordered.
@@ -1861,7 +1865,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::scatterImpl(
     int root,
     bool async_op,
     std::chrono::milliseconds timeout) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(output_tensor);
   checkTensorDevice(output_tensor);
@@ -1897,7 +1901,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::scatterImpl(
   if (async_op && rank_ == root) {
     input_tensors = input_tensor_list;
   }
-  auto work = createWork(stream, timeout, input_tensors);
+  auto work = createWork(reconfigureCount, stream, timeout, input_tensors);
 
   // Record start event before NCCL operations
   work->recordStart("scatter");
@@ -1982,7 +1986,7 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::gatherImpl(
     std::chrono::milliseconds timeout,
     bool contiguous_output,
     const MaterializedCollectiveConfig& native_config) {
-  checkInitialized();
+  const auto reconfigureCount = checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(input_tensor);
   checkTensorDevice(input_tensor);
@@ -2018,8 +2022,9 @@ c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::gatherImpl(
   if (rank_ == root) {
     output_tensors = output_tensor_list;
   }
-  auto work = async_op ? createWork(stream, timeout, input_tensor)
-                       : createWork(stream, timeout);
+  auto work = async_op
+      ? createWork(reconfigureCount, stream, timeout, input_tensor)
+      : createWork(reconfigureCount, stream, timeout);
 
   // Record start event before NCCL operations
   work->recordStart("gather");

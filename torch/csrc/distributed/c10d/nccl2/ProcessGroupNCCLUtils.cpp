@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/util/Exception.h>
 #include <c10/util/flat_hash_map.h>
 #include <c10/util/hash.h>
 #include <nccl.h>
@@ -23,6 +24,9 @@
 namespace c10d::nccl2 {
 
 namespace {
+
+constexpr const char* kReconfiguringMessage =
+    "ProcessGroupNCCL is being reconfigured";
 
 // Scaling factor for a PREMUL_SUM reduction: either a per-element device tensor
 // or a host scalar.
@@ -418,11 +422,17 @@ void ProcessGroupNCCL::timeoutWatchdog() noexcept {
   TC_LOG(INFO, this) << "Timeout thread exiting for rank: " << rank_;
 }
 
-void ProcessGroupNCCL::checkInitialized() {
+uint64_t ProcessGroupNCCL::checkInitialized() {
+  const auto reconfigureCount = currentReconfigureCount();
+  TORCH_CHECK_WITH(
+      DistBackendError,
+      !reconfiguring_.load(std::memory_order_acquire),
+      kReconfiguringMessage);
+  const auto boundDeviceId = getBoundDeviceId();
   if (options_c10d_->lazy_init &&
       init_state_ == InitializationState::UNINITIALIZED &&
-      getBoundDeviceId().has_value()) {
-    ensureInitialized(*getBoundDeviceId());
+      boundDeviceId.has_value()) {
+    ensureInitialized(*boundDeviceId);
   }
   TORCH_CHECK(
       init_state_ == InitializationState::INITIALIZED,
@@ -430,6 +440,7 @@ void ProcessGroupNCCL::checkInitialized() {
           ? "ProcessGroupNCCL has not been initialized. Call reconfigure() "
             "before issuing operations when enable_reconfigure=True."
           : "ProcessGroupNCCL not initialized");
+  return reconfigureCount;
 }
 
 void ProcessGroupNCCL::checkAndAbortIfTimedOutOrError() {
@@ -483,27 +494,47 @@ bool ProcessGroupNCCL::getGraphCaptureMode() {
   return c10::cuda::isStreamCapturingMayInitCtx(current_stream);
 }
 
+std::shared_lock<std::shared_mutex> ProcessGroupNCCL::admitCollective(
+    uint64_t reconfigureCount) {
+  std::shared_lock admission(collective_admission_mutex_);
+  TORCH_CHECK_WITH(
+      DistBackendError,
+      !reconfiguring_.load(std::memory_order_acquire),
+      kReconfiguringMessage);
+  TORCH_CHECK_WITH(
+      DistBackendError,
+      currentReconfigureCount() == reconfigureCount,
+      "ProcessGroupNCCL was reconfigured while this operation was being issued");
+  return admission;
+}
+
 c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::createWork(
+    uint64_t reconfigureCount,
     cudaStream_t stream,
     std::chrono::milliseconds timeout,
     const std::vector<at::Tensor>& inputTensors) {
+  auto admission = admitCollective(reconfigureCount);
   // Only create the work object without enqueuing it
   auto [workTimeout, ownedTimeout] = applyEphemeralTimeout(timeout);
   auto work =
       c10::make_intrusive<WorkNCCL>(this, stream, workTimeout, inputTensors);
+  work->submissionLock_ = std::move(admission);
   work->setOwnedEphemeralTimeout(ownedTimeout);
   work->setSequenceNumber(sequence_number_);
   return work;
 }
 
 c10::intrusive_ptr<WorkNCCL> ProcessGroupNCCL::createWork(
+    uint64_t reconfigureCount,
     cudaStream_t stream,
     std::chrono::milliseconds timeout,
     const at::Tensor& inputTensor) {
+  auto admission = admitCollective(reconfigureCount);
   // Single-tensor overload to avoid vector allocation
   auto [workTimeout, ownedTimeout] = applyEphemeralTimeout(timeout);
   auto work =
       c10::make_intrusive<WorkNCCL>(this, stream, workTimeout, inputTensor);
+  work->submissionLock_ = std::move(admission);
   work->setOwnedEphemeralTimeout(ownedTimeout);
   work->setSequenceNumber(sequence_number_);
   return work;
@@ -534,6 +565,7 @@ void ProcessGroupNCCL::addEphemeralTimeout(
 void ProcessGroupNCCL::enqueueWork(
     const c10::intrusive_ptr<WorkNCCL>& work,
     cudaStream_t stream) {
+  auto admission = std::move(work->submissionLock_);
   if (coalescing_batch_) {
     coalescing_works_.push_back(work);
   }
@@ -562,6 +594,30 @@ void ProcessGroupNCCL::enqueueWork(
   } else {
     // Add work to stream's queue after events have been recorded
     workq_.enqueueWork(work, stream);
+  }
+}
+
+void ProcessGroupNCCL::failPendingGeneration(int64_t reconfigure_uuid) {
+  auto exception = std::make_exception_ptr(C10_BUILD_ERROR(
+      DistBackendError,
+      "NCCL operation was cancelled by reconfigure() of its communicator"));
+  workq_.failPendingGeneration(reconfigure_uuid, exception);
+
+  std::vector<std::shared_ptr<WorkNCCL::State>> capturedWorks;
+  {
+    std::lock_guard<std::mutex> lock(graph_capture_work_mutex_);
+    for (const auto& [_, states] : graph_capture_work_refs_) {
+      for (const auto& state : states) {
+        if (state->reconfigureUuid == reconfigure_uuid) {
+          capturedWorks.push_back(state);
+        }
+      }
+    }
+  }
+  // Outside the lock: result callbacks may re-enter c10d.
+  for (const auto& state : capturedWorks) {
+    state->setTerminalStatus(WorkNCCL::WorkStatus::ERROR, exception);
+    state->publishResult();
   }
 }
 

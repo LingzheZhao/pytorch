@@ -758,6 +758,7 @@ class ProcessGroupNCCL2Test(MultiProcContinuousTest):
             self.assertTrue(work.is_completed())
 
 
+@instantiate_parametrized_tests
 class ProcessGroupNCCL2WorkLifetimeTest(MultiProcessTestCase):
     @property
     def world_size(self) -> int:
@@ -796,6 +797,283 @@ class ProcessGroupNCCL2WorkLifetimeTest(MultiProcessTestCase):
         dist.destroy_process_group()
         del work
         gc.collect()
+
+    def _reconfigure_options(
+        self, store: dist.Store, uuid: int, timeout: timedelta
+    ) -> ReconfigureOptions:
+        key = f"nccl2_reconfigure/{uuid}"
+        store.set(f"{key}/{self.rank}", dist.group.WORLD.get_reconfigure_handle())
+        opts = ReconfigureOptions()
+        opts.uuid = uuid
+        opts.handles = [
+            store.get(f"{key}/{rank}").decode() for rank in range(self.world_size)
+        ]
+        opts.timeout = timeout
+        return opts
+
+    def _init_reconfigured_group(
+        self, device: torch.device, timeout: timedelta, blocking_wait: bool = False
+    ) -> dist.Store:
+        store = dist.FileStore(self.file_name, self.world_size)
+        store.set_timeout(timeout)
+        env = {"TORCH_NCCL_BLOCKING_WAIT": str(int(blocking_wait))}
+        with mock.patch.dict(os.environ, env):
+            dist.init_process_group(
+                "nccl2",
+                world_size=self.world_size,
+                rank=self.rank,
+                store=store,
+                timeout=timeout,
+                enable_reconfigure=True,
+                device_id=device,
+            )
+        options = self._reconfigure_options(store, 1, timeout)
+        dist.group.WORLD.reconfigure(options).wait()
+        return store
+
+    def _assert_group_healthy(self, device: torch.device) -> None:
+        health = torch.tensor([self.rank + 1], device=device)
+        dist.all_reduce(health)
+        self.assertEqual(int(health.item()), sum(range(1, self.world_size + 1)))
+
+    @requires_nccl()
+    @requires_nccl_version((2, 28), "Need NCCL 2.28+ for reconfigure")
+    @unittest.skipIf(
+        TEST_WITH_ROCM
+        and dist.is_nccl_available()
+        and torch.cuda.nccl.version() < (2, 30, 7),
+        "nccl2 reconfigure requires RCCL 2.30.7 or later",
+    )
+    @skip_if_lt_x_gpu(2)
+    @parametrize("blocking_wait", [False, True])
+    def test_reconfigure_old_work(self, blocking_wait: bool) -> None:
+        device = torch.device("cuda", self.rank)
+        torch.cuda.set_device(device)
+        timeout = timedelta(seconds=30)
+        store = self._init_reconfigured_group(device, timeout, blocking_wait)
+        try:
+            next_options = self._reconfigure_options(store, 2, timeout)
+
+            # Finished but not observed before reconfigure(); async ops run on an
+            # internal stream, so sync the device.
+            completed = torch.tensor([self.rank + 1], device=device)
+            completed_work = dist.all_reduce(completed, async_op=True)
+            torch.cuda.synchronize(device)
+
+            # No other rank issues this collective, so it cannot complete.
+            waited: list[RuntimeError] = []
+            rejected: list[RuntimeError] = []
+            aborted: list[int] = []
+            if self.rank == 0:
+                dist.group.WORLD.register_abort_hook(0, lambda: aborted.append(1))
+                old_work = dist.all_reduce(torch.ones(4, device=device), async_op=True)
+
+                def on_cancel(_: torch.futures.Future) -> None:
+                    try:
+                        old_work.wait()
+                    except RuntimeError as e:
+                        waited.append(e)
+                    try:
+                        dist.all_reduce(torch.ones(1, device=device))
+                    except RuntimeError as e:
+                        rejected.append(e)
+
+                # Runs inside reconfigure(), when old_work is cancelled.
+                old_work.get_future_result().then(on_cancel)
+            store.set(f"reconfigure_ready/{self.rank}", "1")
+            for rank in range(self.world_size):
+                store.get(f"reconfigure_ready/{rank}")
+
+            dist.group.WORLD.reconfigure(next_options).wait()
+            if self.rank == 0:
+                with self.assertRaisesRegex(
+                    dist.DistBackendError, "cancelled by reconfigure"
+                ):
+                    old_work.wait()
+            # Rank 0 asserts after this collective, so a failure cannot hang the peer.
+            self._assert_group_healthy(device)
+            if self.rank == 0:
+                old_result = old_work.get_future_result()
+                self.assertTrue(old_result.done())
+                self.assertEqual(WorkResult(old_result.wait()), WorkResult.COMM_ERROR)
+                self.assertEqual(len(waited), 1)
+                self.assertIsInstance(waited[0], dist.DistBackendError)
+                self.assertEqual(aborted, [])
+                self.assertEqual(len(rejected), 1)
+                self.assertIsInstance(rejected[0], dist.DistBackendError)
+                self.assertIn("is being reconfigured", str(rejected[0]))
+            completed_result = completed_work.get_future_result()
+            self.assertTrue(completed_result.done())
+            self.assertEqual(WorkResult(completed_result.wait()), WorkResult.SUCCESS)
+            completed_work.wait()
+            expected = sum(range(1, self.world_size + 1))
+            self.assertEqual(completed, torch.full_like(completed, expected))
+        finally:
+            dist.destroy_process_group()
+
+    @requires_nccl()
+    @requires_nccl_version((2, 28), "Need NCCL 2.28+ for reconfigure")
+    @unittest.skipIf(
+        TEST_WITH_ROCM
+        and dist.is_nccl_available()
+        and torch.cuda.nccl.version() < (2, 30, 7),
+        "nccl2 reconfigure requires RCCL 2.30.7 or later",
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_reconfigure_retry_after_failure(self) -> None:
+        device = torch.device("cuda", self.rank)
+        torch.cuda.set_device(device)
+        timeout = timedelta(seconds=30)
+        store = self._init_reconfigured_group(device, timeout)
+        try:
+            failing_options = self._reconfigure_options(store, 2, timedelta(seconds=2))
+            # Rank 1 joins only after rank 0 timed out: both fail after teardown.
+            if self.rank != 0:
+                store.get("reconfigure_failed/0")
+            with self.assertRaisesRegex(
+                RuntimeError, "commInitRankConfig failed during reconfigure"
+            ):
+                dist.group.WORLD.reconfigure(failing_options).wait()
+            if self.rank == 0:
+                store.set("reconfigure_failed/0", "1")
+
+            retry_options = self._reconfigure_options(store, 3, timeout)
+            dist.group.WORLD.reconfigure(retry_options).wait()
+            self._assert_group_healthy(device)
+        finally:
+            dist.destroy_process_group()
+
+    @requires_nccl()
+    @requires_nccl_version((2, 28), "Need NCCL 2.28+ for reconfigure")
+    @unittest.skipIf(
+        TEST_WITH_ROCM
+        and dist.is_nccl_available()
+        and torch.cuda.nccl.version() < (2, 30, 7),
+        "nccl2 reconfigure requires RCCL 2.30.7 or later",
+    )
+    @skip_if_lt_x_gpu(2)
+    @mock.patch.dict(os.environ, {"NCCL_RUNTIME_CONNECT": "1"})
+    def test_reconfigure_during_stalled_launch(self) -> None:
+        # With runtime connect, rank 0's first collective blocks in its launch,
+        # since the peer never joins it.
+        device = torch.device("cuda", self.rank)
+        torch.cuda.set_device(device)
+        timeout = timedelta(seconds=30)
+        store = self._init_reconfigured_group(device, timeout)
+        try:
+            group = dist.group.WORLD
+            works: list[dist.Work] = []
+            launch_errors: list[RuntimeError] = []
+            if self.rank == 0:
+                # Longer than the reconfigure timeout, so it cannot just be waited out.
+                dist.get_backend_impl(group, device).set_timeout(timedelta(minutes=5))
+                launching = threading.Event()
+                group.register_pre_hook(0, lambda _: launching.set())
+
+                def launch() -> None:
+                    try:
+                        works.append(
+                            dist.all_reduce(torch.ones(4, device=device), async_op=True)
+                        )
+                    except RuntimeError as e:
+                        launch_errors.append(e)
+
+                launcher = threading.Thread(target=launch, daemon=True)
+                launcher.start()
+                launching.wait(timeout=60)
+                # Still running after this: stuck in the launch, not just slow.
+                launcher.join(timeout=2)
+            next_options = self._reconfigure_options(store, 2, timeout)
+            stalled = self.rank == 0 and launcher.is_alive()
+            group.reconfigure(next_options).wait()
+            self._assert_group_healthy(device)
+            if self.rank == 0:
+                launcher.join(timeout=60)
+                self.assertFalse(launcher.is_alive())
+                self.assertTrue(stalled)
+                # Admitted before reconfigure(): it fails or its work is cancelled.
+                self.assertEqual(len(works) + len(launch_errors), 1)
+                for error in launch_errors:
+                    self.assertNotIn("is being reconfigured", str(error))
+                for work in works:
+                    with self.assertRaisesRegex(
+                        dist.DistBackendError, "cancelled by reconfigure"
+                    ):
+                        work.wait()
+        finally:
+            dist.destroy_process_group()
+
+    @requires_nccl()
+    @requires_nccl_version((2, 28), "Need NCCL 2.28+ for reconfigure")
+    @unittest.skipIf(
+        TEST_WITH_ROCM
+        and dist.is_nccl_available()
+        and torch.cuda.nccl.version() < (2, 30, 7),
+        "nccl2 reconfigure requires RCCL 2.30.7 or later",
+    )
+    @skip_if_lt_x_gpu(2)
+    def test_reconfigure_during_collective(self) -> None:
+        # A result callback run by rank 0's collective, after its arguments were
+        # checked, blocks while another thread reconfigures the group.
+        device = torch.device("cuda", self.rank)
+        torch.cuda.set_device(device)
+        timeout = timedelta(seconds=30)
+        store = self._init_reconfigured_group(device, timeout)
+        try:
+            group = dist.group.WORLD
+            caller = threading.get_ident()
+            probing = threading.Event()
+            reconfigured = threading.Event()
+            errors: list[RuntimeError] = []
+
+            def reconfigure() -> None:
+                group.reconfigure(self._reconfigure_options(store, 2, timeout)).wait()
+                reconfigured.set()
+
+            # Connects the communicator, so the pending launch below returns.
+            self._assert_group_healthy(device)
+            for attempt in range(3):
+                if self.rank != 0:
+                    store.get(f"registered/{attempt}")
+                    dist.all_reduce(torch.ones(1, device=device))
+                    if store.get(f"probe/{attempt}") == b"reconfigure":
+                        reconfigure()
+                        break
+                    dist.all_reduce(torch.ones(1, device=device))
+                    continue
+
+                def reconfigure_inside_probe(_: torch.futures.Future) -> None:
+                    # The watchdog may have collected the work first.
+                    if probing.is_set() and threading.get_ident() == caller:
+                        store.set(f"probe/{attempt}", "reconfigure")
+                        thread = threading.Thread(target=reconfigure)
+                        thread.start()
+                        thread.join(timeout=60)
+
+                # Registered while pending: get_future_result() itself publishes
+                # the result of finished work.
+                finished = dist.all_reduce(torch.ones(1, device=device), async_op=True)
+                finished.get_future_result().then(reconfigure_inside_probe)
+                store.set(f"registered/{attempt}", "1")
+                torch.cuda.synchronize(device)
+                probing.set()
+                try:
+                    dist.all_reduce(torch.ones(1, device=device), async_op=True)
+                except RuntimeError as e:
+                    errors.append(e)
+                probing.clear()
+                if reconfigured.is_set():
+                    break
+                store.set(f"probe/{attempt}", "retry")
+            # Rank 0 asserts after this collective, so a failure cannot hang the peer.
+            self._assert_group_healthy(device)
+            if self.rank == 0:
+                self.assertTrue(reconfigured.is_set())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], dist.DistBackendError)
+                self.assertIn("reconfigured while this operation", str(errors[0]))
+        finally:
+            dist.destroy_process_group()
 
 
 _TEST_PSK = "0123456789abcdef0123456789abcdef"

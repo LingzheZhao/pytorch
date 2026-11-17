@@ -137,6 +137,7 @@ c10::intrusive_ptr<::c10d::Work> WindowNCCL::put(
     int64_t targetOffsetNelems,
     bool asyncOp,
     const ::c10d::PutOptions& opts) {
+  const auto reconfigureCount = pg_->currentReconfigureCount();
   checkWindowAndThrow();
   checkDeviceAndThrow(tensor);
   checkPeerRankAndThrow(dstRank);
@@ -195,7 +196,7 @@ c10::intrusive_ptr<::c10d::Work> WindowNCCL::put(
 
   cudaStream_t stream = pg_->getOperationStream(asyncOp);
   auto timeout = pg_->operationTimeout(opts.timeout);
-  auto work = pg_->createWork(stream, timeout, tensor);
+  auto work = pg_->createWork(reconfigureCount, stream, timeout, tensor);
   work->recordStart("put");
   NCCL_CHECK(
       nccl_api_, nccl_comm_, nccl_api_->groupStart(), "NCCL GroupStart failed");
@@ -231,12 +232,13 @@ c10::intrusive_ptr<::c10d::Work> WindowNCCL::signal(
     int64_t peerRank,
     bool asyncOp,
     const ::c10d::SignalOptions& opts) {
+  const auto reconfigureCount = pg_->currentReconfigureCount();
   checkWindowAndThrow();
   checkPeerRankAndThrow(peerRank);
   c10::cuda::CUDAGuard device_guard(pg_->getDevice());
   cudaStream_t stream = pg_->getOperationStream(asyncOp);
   auto timeout = pg_->operationTimeout(opts.timeout);
-  auto work = pg_->createWork(stream, timeout);
+  auto work = pg_->createWork(reconfigureCount, stream, timeout);
   work->recordStart("signal");
   NCCL_CHECK(
       nccl_api_, nccl_comm_, nccl_api_->groupStart(), "NCCL GroupStart failed");
@@ -267,12 +269,13 @@ c10::intrusive_ptr<::c10d::Work> WindowNCCL::wait_signal(
     int64_t peerRank,
     bool asyncOp,
     const ::c10d::WaitSignalOptions& opts) {
+  const auto reconfigureCount = pg_->currentReconfigureCount();
   checkWindowAndThrow();
   checkPeerRankAndThrow(peerRank);
   c10::cuda::CUDAGuard device_guard(pg_->getDevice());
   cudaStream_t stream = pg_->getOperationStream(asyncOp);
   auto timeout = pg_->operationTimeout(opts.timeout);
-  auto work = pg_->createWork(stream, timeout);
+  auto work = pg_->createWork(reconfigureCount, stream, timeout);
   work->recordStart("wait_signal");
   NCCL_CHECK(
       nccl_api_, nccl_comm_, nccl_api_->groupStart(), "NCCL GroupStart failed");

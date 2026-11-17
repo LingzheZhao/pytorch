@@ -480,10 +480,14 @@ class AbstractFaultToleranceTest:
         if self.rank == 0:
             work = dist.all_reduce(torch.ones(4, device=self.device), async_op=True)
         self._reconfigure(1801, handles[:last])
-        del work
         self.backend.set_timeout(timedelta(seconds=30))
         self._assert_all_reduce_sum(sum(range(1, self.world_size)))
         self._store_barrier("ft_shrink_pending_done")
+        if work is not None and self.supports_work_result:
+            with self.assertRaisesRegex(
+                dist.DistBackendError, "cancelled by reconfigure|timed out"
+            ):
+                work.wait()
 
     def test_reconfigure_rejects_reused_uuid(self):
         self._init_reconfigurable_pg()

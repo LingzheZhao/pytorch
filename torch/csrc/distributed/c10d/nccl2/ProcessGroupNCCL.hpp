@@ -23,6 +23,7 @@
 #include <optional>
 #include <queue>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -445,13 +446,30 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
   // Serializes revokeNcclComm() with reconfigure()'s teardown, so abort() on
   // another thread cannot still be inside commRevoke when the comm is aborted.
   std::mutex revoke_mutex_;
+  std::atomic<bool> reconfiguring_{false};
+  // Held shared from createWork() until enqueueWork(). Lock order: this
+  // mutex before reconfigure_mutex_.
+  std::shared_mutex collective_admission_mutex_;
+  // Bumped by reconfigure() under collective_admission_mutex_, so createWork()
+  // can reject work that was validated against an older communicator.
+  std::atomic<uint64_t> reconfigure_count_{0};
+  // Replaced only while collective_admission_mutex_ is held exclusively.
+  std::shared_ptr<WorkNCCL::GenerationState> work_generation_state_{
+      std::make_shared<WorkNCCL::GenerationState>()};
 
   ncclDataType_t getNcclDataType(const at::Tensor& tensor);
+  uint64_t currentReconfigureCount() const {
+    return reconfigure_count_.load(std::memory_order_acquire);
+  }
+  std::shared_lock<std::shared_mutex> admitCollective(
+      uint64_t reconfigureCount);
   c10::intrusive_ptr<WorkNCCL> createWork(
+      uint64_t reconfigureCount,
       cudaStream_t stream,
       std::chrono::milliseconds timeout,
       const std::vector<at::Tensor>& inputTensors = {});
   c10::intrusive_ptr<WorkNCCL> createWork(
+      uint64_t reconfigureCount,
       cudaStream_t stream,
       std::chrono::milliseconds timeout,
       const at::Tensor& inputTensor);
@@ -628,10 +646,12 @@ class TORCH_API ProcessGroupNCCL : public ::c10d::Backend {
       ncclComm_t comm,
       const at::Tensor& tensor);
   void timeoutWatchdog() noexcept;
-  // Creates a lazy_init communicator and checks that it is ready.
-  void checkInitialized();
+  // Creates a lazy_init communicator and checks that it is ready. Returns the
+  // reconfigure count to pass to createWork().
+  uint64_t checkInitialized();
   void checkAndAbortIfTimedOutOrError();
   void checkWorkQueue();
+  void failPendingGeneration(int64_t reconfigure_uuid);
   void drainRetiredGraphWork();
   std::pair<std::chrono::milliseconds, std::chrono::milliseconds>
   applyEphemeralTimeout(std::chrono::milliseconds timeout);
