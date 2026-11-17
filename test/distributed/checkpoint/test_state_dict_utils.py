@@ -318,8 +318,11 @@ class TestCreateCpuStateDictStorageOffset(TestCase):
         super().tearDown()
         dist.destroy_process_group()
 
+    @parametrize("pin_memory", [False, True])
     @parametrize("offset", [0, 4])
-    def test_create_and_copy_cpu_state_dict(self, offset):
+    def test_create_and_copy_cpu_state_dict(self, offset, pin_memory):
+        if pin_memory and not torch.accelerator.is_available():
+            self.skipTest("pin_memory requires an accelerator")
         mesh = init_device_mesh("cpu", (1,))
         a, b = torch.arange(12.0), torch.arange(12.0) + 100
         state_dict = {
@@ -328,9 +331,13 @@ class TestCreateCpuStateDictStorageOffset(TestCase):
             ),
             "two_tensor": TwoTensor(a[offset : offset + 4], b[offset : offset + 4]),
         }
-        cpu_state_dict = _create_cpu_state_dict(state_dict)
+        cpu_state_dict = _create_cpu_state_dict(state_dict, pin_memory=pin_memory)
         self.assertIs(type(cpu_state_dict["dtensor"]), DTensor)
         self.assertIs(type(cpu_state_dict["two_tensor"]), TwoTensor)
+        if pin_memory:
+            self.assertTrue(cpu_state_dict["dtensor"].to_local().is_pinned())
+            self.assertTrue(cpu_state_dict["two_tensor"].a.is_pinned())
+            self.assertTrue(cpu_state_dict["two_tensor"].b.is_pinned())
 
         _copy_state_dict(state_dict, cpu_state_dict)
         self.assertEqual(

@@ -423,6 +423,8 @@ def _create_cpu_state_dict(
             t = torch.zeros_like(obj, device="cpu")
             if share_memory:
                 t = t.share_memory_()
+            elif pin_memory and obj.numel() > 0:
+                t = t.pin_memory()
             return t
 
         if share_memory:
