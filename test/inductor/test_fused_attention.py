@@ -21,7 +21,10 @@ from torch.testing._internal.common_cuda import (
     PLATFORM_SUPPORTS_FUSED_ATTENTION,
     SM80OrLater,
 )
-from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_device_type import (
+    expectedFailureXPU,
+    instantiate_device_type_tests,
+)
 from torch.testing._internal.common_utils import (
     add_skip_condition,
     HardwareClassification,
@@ -980,6 +983,7 @@ class TestSDPAPatternRewriterTemplate(TestCase):
         )
         self.assertEqual(counters["inductor"]["fuse_attention"], 0)
 
+    @expectedFailureXPU  # https://github.com/intel/torch-xpu-ops/issues/6243
     def _test_sdpa_rewriter_stacked_layers_with_mask(self):
         # HF BERT shape: stacked attention layers share the batch dim.  Under
         # dynamic shapes the s0*heads size from matmul's reshape is one sym
