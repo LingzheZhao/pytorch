@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import sys
 import tempfile
 import types
@@ -1979,6 +1980,36 @@ class TestRecheckAutotuneCache(TestCase):
         # Nothing should change
         self.assertEqual(len(autotuner.compile_results), 2)
 
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_recheck_miss_keeps_found_by_coordesc(self):
+        """
+        An FX graph cache static autotuner holds only the coordesc winner, so
+        the recheck hashes [winner] and misses. The miss must not clear the
+        mark that the compile result carried across pickling.
+        """
+        cfg = triton_config({"x": 16}, 64)
+        cfg.found_by_coordesc = True
+        compile_result = self._make_compile_result(cfg)
+
+        autotuner = self._make_autotuner_with_results([cfg], [compile_result])
+
+        with patch(
+            "torch._inductor.runtime.triton_heuristics.check_autotune_cache",
+            return_value=(
+                [triton_config({"x": 16}, 64)],
+                None,
+                {"autotune_cache_state": "miss"},
+            ),
+        ):
+            autotuner.recheck_autotune_cache(
+                reload_kernel_from_src=MagicMock(
+                    side_effect=AssertionError("unexpected compilation")
+                )
+            )
+
+        self.assertEqual(autotuner.compile_results, [compile_result])
+        self.assertTrue(compile_result.config.found_by_coordesc)
+
 
 @triton.jit
 def hip_autotune_kernel(
@@ -2004,6 +2035,139 @@ def get_hip_autotune_kernel_with_invalid_config():
         ],
         key=["numel"],
     )(hip_autotune_kernel)
+
+
+class TestCoordescCacheHitAcrossPickle(TestCase):
+    """A coordinate descent winner read from the autotune cache must not be
+    re-tuned after the autotuner is pickled (compile worker -> parent, FX
+    graph cache bundle). triton.Config.__setstate__ drops the
+    ``found_by_coordesc`` attribute, so the autotuner has to carry it."""
+
+    _FILENAME = "/tmp/fake_kernel.py"
+
+    @staticmethod
+    def _inputs():
+        from torch._dynamo.device_interface import get_interface_for_device
+
+        device_interface = get_interface_for_device(GPU_TYPE)
+        stream = device_interface.get_raw_stream(device_interface.current_device())
+        in_ptr = torch.zeros(16, device=GPU_TYPE, dtype=torch.float32)
+        out_ptr = torch.zeros(16, device=GPU_TYPE, dtype=torch.float32)
+        return (in_ptr, out_ptr, 16), stream
+
+    @staticmethod
+    def _cache_hit_autotuner(found_by_coordesc):
+        args = TestTritonHeuristics._get_cos_kernel_caching_autotuner_args()
+        winner = triton_config({"x": 16}, 64)
+        winner.found_by_coordesc = found_by_coordesc
+        args["configs"] = [winner]
+        args["inductor_meta"] = {
+            **args["inductor_meta"],
+            "grid_type": "Grid1D",
+            "coordinate_descent_tuning": True,
+        }
+        args["filename"] = TestCoordescCacheHitAcrossPickle._FILENAME
+        cache = MagicMock()
+        cache.read_best.return_value = winner
+        with patch(
+            "torch._inductor.runtime.triton_heuristics.AutotuneCache.create",
+            return_value=cache,
+        ):
+            configs, _, info = check_autotune_cache(
+                args["configs"], args["filename"], args["inductor_meta"]
+            )
+        args["configs"] = configs
+        args["autotune_cache_info"] = info
+        return CachingAutotuner(**args)
+
+    @staticmethod
+    def _to_parent(autotuner):
+        """Precompile in a "worker" and unpickle the result in the parent."""
+        autotuner.precompile(warm_cache_only=True)
+        old_values = autotuner.prepare_for_pickle()
+        payload = pickle.dumps(autotuner)
+        autotuner.restore_after_unpickle(old_values)
+        parent = pickle.loads(payload)
+        parent.restore_after_unpickle(old_values)
+        return parent
+
+    @classmethod
+    def _round_trip(cls, autotuner):
+        parent = cls._to_parent(autotuner)
+        parent.precompile()
+        return parent
+
+    def _run_without_coordesc(self, autotuner):
+        args, stream = self._inputs()
+        with patch.object(
+            CachingAutotuner,
+            "coordinate_descent_tuning",
+            side_effect=AssertionError("re-tuned a cached coordesc winner"),
+        ) as coordesc:
+            autotuner.run(*args, stream=stream)
+        coordesc.assert_not_called()
+        torch.testing.assert_close(args[1], torch.ones_like(args[1]))
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_cache_info_records_coordesc_hit(self):
+        autotuner = self._cache_hit_autotuner(found_by_coordesc=True)
+        self.assertEqual(autotuner.autotune_cache_info["autotune_cache_state"], "hit")
+        self.assertTrue(autotuner.autotune_cache_info["found_by_coordesc"])
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_cached_coordesc_winner_not_retuned_after_pickle(self):
+        parent = self._round_trip(self._cache_hit_autotuner(found_by_coordesc=True))
+        self._run_without_coordesc(parent)
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    @config.patch(use_static_cuda_launcher=True)
+    def test_static_autotuner_winner_not_retuned_after_recheck_miss(self):
+        """FX graph cache hit: the bundled static autotuner (deep-copied, then
+        pickled) holds only the cached winner, so recheck_autotune_cache hashes
+        [winner] and misses. The winner must still not be re-tuned."""
+        from torch._inductor.triton_bundler import TritonBundler
+
+        parent = self._to_parent(self._cache_hit_autotuner(found_by_coordesc=True))
+        with patch.object(TritonBundler, "_static_autotuners", []) as entries:
+            parent.precompile(static_triton_bundle_key="fx_graph_cache_key")
+        (entry,) = entries
+        static = pickle.loads(pickle.dumps(entry.kernel))
+        self.assertTrue(static.is_statically_launchable())
+
+        miss = MagicMock()
+        miss.read_best.return_value = None
+        reload_kernel = MagicMock(side_effect=AssertionError("unexpected reload"))
+        with patch(
+            "torch._inductor.runtime.triton_heuristics.AutotuneCache.create",
+            return_value=miss,
+        ):
+            static.recheck_autotune_cache(reload_kernel_from_src=reload_kernel)
+        self.assertEqual(static.autotune_cache_info["autotune_cache_state"], "miss")
+        static.precompile(reload_kernel=reload_kernel)
+        self._run_without_coordesc(static)
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    @config.patch(use_static_cuda_launcher=True)
+    def test_precompile_export_accepts_cached_coordesc_winner(self):
+        """A worker-compiled kernel whose coordesc winner came from the cache
+        is fully tuned, so precompile export must accept it."""
+        from torch.compiler._runtime_cache import _triton_export_rejection
+
+        parent = self._round_trip(self._cache_hit_autotuner(found_by_coordesc=True))
+        self._run_without_coordesc(parent)
+        self.assertIsNone(_triton_export_rejection(parent))
+
+    @skipUnless(HAS_GPU_AND_TRITON, "requires gpu and triton")
+    def test_cached_heuristic_config_still_tuned_after_pickle(self):
+        parent = self._round_trip(self._cache_hit_autotuner(found_by_coordesc=False))
+        args, stream = self._inputs()
+        with patch.object(
+            CachingAutotuner,
+            "coordinate_descent_tuning",
+            side_effect=lambda launcher, *a, **k: launcher,
+        ) as coordesc:
+            parent.run(*args, stream=stream)
+        coordesc.assert_called_once()
 
 
 class TestHIPInvalidConfigHandling(TestCase):

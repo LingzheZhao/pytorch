@@ -515,6 +515,8 @@ def check_autotune_cache(
                     best_config
                 )
                 autotune_cache_info["autotune_cache_state"] = "hit"
+                if getattr(best_config, "found_by_coordesc", False):
+                    autotune_cache_info["found_by_coordesc"] = True
 
             else:
                 autotune_cache_info["autotune_cache_state"] = "miss"
@@ -894,9 +896,13 @@ class CachingAutotuner(KernelInterface):
             dynamic_scale_rblock_eligible=self._could_rblock_scale,
         )
         self.autotune_cache_info = autotune_cache_info
-        # I.e. there was an autotune cache hit
-        if len(cached_configs) == 1:
-            best_config = cached_configs[0]
+        # Only a hit changes the compile results. A miss returns the configs
+        # unchanged and must keep the coordesc marks they carried across
+        # pickling: an FX graph cache static autotuner that holds only the
+        # winner always misses, since [winner] does not hash like the configs
+        # the cache entry was saved under.
+        if autotune_cache_info.get("autotune_cache_state") == "hit":
+            (best_config,) = cached_configs
             found_by_coordesc = getattr(best_config, "found_by_coordesc", False)
             # Grab the best compiled config, if it's in the list of available ones
             best_config_hash = triton_config_to_hashable(best_config)
@@ -1381,12 +1387,45 @@ class CachingAutotuner(KernelInterface):
             "lock": None,
             "_plugins": [],
             "fallback": None,
+            "_coordesc_marks": self._coordesc_marks(),
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        marks = state.pop("_coordesc_marks", {})
         self.__dict__.update(state)
+        self._restore_coordesc_marks(marks)
         self.lock = threading.Lock()
         self._plugins = get_caching_autotuner_plugins(self)
+
+    def _coordesc_configs(self) -> dict[str, list[Config]]:
+        return {
+            "configs": list(self.configs or ()),
+            "compile_results": [result.config for result in self.compile_results],
+        }
+
+    def _coordesc_marks(self) -> dict[str, list[int]]:
+        """Indices of the configs that coordinate descent already picked.
+
+        triton.Config.__setstate__ restores only Triton's own fields, so the
+        ``found_by_coordesc`` mark is lost whenever a config is unpickled or
+        deep-copied (compile workers, FX graph cache static autotuners) and
+        run() would tune a cached winner again. __getstate__ records the
+        marks and __setstate__ puts them back.
+        """
+        return {
+            key: [
+                i
+                for i, cfg in enumerate(configs)
+                if getattr(cfg, "found_by_coordesc", False)
+            ]
+            for key, configs in self._coordesc_configs().items()
+        }
+
+    def _restore_coordesc_marks(self, marks: dict[str, list[int]]) -> None:
+        configs = self._coordesc_configs()
+        for key, indices in marks.items():
+            for i in indices:
+                configs[key][i].found_by_coordesc = True
 
     def get_device_interface(self):
         # this code cannot run in compile workers, because it imports from torch
