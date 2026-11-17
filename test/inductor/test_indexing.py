@@ -432,7 +432,7 @@ class TestIndexingSimplification(InductorTestCase):
 
         # the FloorDiv pattern can simplify away: FloorDiv(64 * i0, 64) is i0, so
         # the matching term has no FloorDiv
-        expr8 = ModularIndexing(64 * i0, 1, 64) + 64 * i0
+        expr8 = ModularIndexing(64 * i0, 1, 64, evaluate=False) + 64 * i0
         self.assertEqual(join_dimensions(expr8), 64 * i0)
 
     def test_modular_indexing_pairs_merged(self):
@@ -470,6 +470,19 @@ class TestIndexingSimplification(InductorTestCase):
         expr = ModularIndexing(divisor * x * (s + 1) + y, divisor, s + 1)
 
         self.assertEqual(expr, ModularIndexing(y, divisor, s + 1))
+
+    def test_modular_indexing_cancel_fractional_period(self):
+        s, x = sympy.symbols("s x", integer=True, positive=True)
+        expr = ModularIndexing(x * (s**2 + s) / 2, 1, s + 1)
+
+        self.assertEqual(expr.subs({x: 1, s: 3}), 2)
+
+    def test_modular_indexing_cancel_fractional_even_period(self):
+        s = sympy.Symbol("s", integer=True, positive=True)
+        e = sympy.Symbol("e", even=True, positive=True)
+        expr = ModularIndexing(e * (s**2 + 2 * s + 1) / 18, 1, s + 1)
+
+        self.assertEqual(expr.subs({s: 2, e: 2}), 1)
 
     def test_modular_indexing_fractional_period(self):
         w = sympy.Symbol("w", integer=True, positive=True)

@@ -35,6 +35,7 @@ _Ts = TypeVarTuple("_Ts")
 # (dmp_sqr / dmp_rr_div) that scales poorly in the number of symbols.
 # safe_gcd() falls back to simple_floordiv_gcd past this threshold.
 _MAX_ADD_TERMS_FOR_POLY_GCD = 20
+_NEEDS_SYMPY_INTEGER_FIX = TorchVersion(sympy.__version__) < TorchVersion("1.15.0")
 
 
 def _is_wide_add(expr: sympy.Basic) -> bool:
@@ -143,11 +144,9 @@ def fuzzy_eq(x: bool | None, y: bool | None) -> bool | None:
 def _is_integer(expr: sympy.Expr) -> bool:
     if expr.is_integer is not True:
         return False
-    # Work around https://github.com/sympy/sympy/pull/28442: a Mul with a
-    # fractional coefficient can incorrectly report is_integer=True.
-    if isinstance(expr, sympy.Mul) and TorchVersion(sympy.__version__) < TorchVersion(
-        "1.15.0"
-    ):
+    # Work around https://github.com/sympy/sympy/pull/28442: expressions with
+    # fractional coefficients can incorrectly report is_integer=True.
+    if _NEEDS_SYMPY_INTEGER_FIX:
         return all(r.q == 1 for r in expr.atoms(sympy.Rational))
     return True
 
@@ -373,7 +372,12 @@ class ModularIndexing(sympy.Function):
                     is_multiple = _is_integer(quotient)
                     if is_multiple:
                         is_multiple = safe_gcd(term, period) == period
-                    elif isinstance(period, sympy.Add) and quotient.is_integer is None:
+                    elif (
+                        isinstance(period, sympy.Add)
+                        and quotient.is_integer is None
+                        and not _is_wide_add(period)
+                        and period.free_symbols <= term.free_symbols
+                    ):
                         is_multiple = safe_gcd(term, period) == period and _is_integer(
                             sympy.cancel(quotient)
                         )
