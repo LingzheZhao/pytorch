@@ -360,32 +360,33 @@ class ModularIndexing(sympy.Function):
         except sympy.PolynomialError:
             pass  # https://github.com/pytorch/pytorch/issues/108276
 
-        # Guard on width: the per-term gcd calls are cheap (via safe_gcd),
-        # but the result feeds into downstream sympy.expand() which blows up
-        # on wide Add expressions (e.g. in sizevars.simplify).
+        # Drop integer multiples of the period, including single-term bases.
+        # GCD alone also accepts fractional multiples. Skip wide sums because
+        # the result feeds into expensive downstream sympy.expand() calls.
         if not _is_wide_add(base):
             terms = sympy.Add.make_args(base)
             period = modulus * divisor
             new_terms: list[sympy.Expr] = []
             all_nonnegative: bool = True
-            for term in terms:
-                if (
-                    safe_gcd(term, period) != period
-                    or (term / period).is_integer is not True
-                ):
-                    if term.is_nonnegative is not True:
-                        # workaround for https://github.com/triton-lang/triton/issues/619,
-                        # if terms are not provably nonnegative, // can produce
-                        # the wrong result
-                        # TODO if https://github.com/triton-lang/triton/issues/619 is fixed
-                        # this optimization would become valid
-                        all_nonnegative = False
-                        break
-                    else:
-                        new_terms.append(term)
+            try:
+                for term in terms:
+                    is_multiple = (term / period).is_integer is True
+                    if not is_multiple or safe_gcd(term, period) != period:
+                        if term.is_nonnegative is not True:
+                            # workaround for https://github.com/triton-lang/triton/issues/619,
+                            # if terms are not provably nonnegative, // can produce
+                            # the wrong result
+                            # TODO if https://github.com/triton-lang/triton/issues/619 is fixed
+                            # this optimization would become valid
+                            all_nonnegative = False
+                            break
+                        else:
+                            new_terms.append(term)
 
-            if len(new_terms) != len(terms) and all_nonnegative:
-                return ModularIndexing(sum(new_terms), divisor, modulus)
+                if len(new_terms) != len(terms) and all_nonnegative:
+                    return ModularIndexing(sum(new_terms), divisor, modulus)
+            except sympy.PolynomialError:
+                pass  # https://github.com/pytorch/pytorch/issues/108276
 
         if isinstance(base, FloorDiv):
             return ModularIndexing(base.args[0], base.args[1] * divisor, modulus)

@@ -64,6 +64,7 @@ DENSE_X_INDEX_LOAD = r"tl\.load\([^\n]*tl\.broadcast_to\(x\d+, \[XBLOCK, R0_BLOC
 REDUCTION_DEPENDENT_LOAD = r"tl\.load\([^\n]*r0_"
 
 
+@instantiate_parametrized_tests
 class TestIndexingSimplification(InductorTestCase):
     def test_simplify_index_in_vec_range(self):
         i = sympy.Symbol("i", integer=True, nonnegative=True)
@@ -468,6 +469,26 @@ class TestIndexingSimplification(InductorTestCase):
         expr = ModularIndexing(w * (w + 1) / 2 + 1, 1, w)
 
         self.assertEqual(expr.subs(w, 4), 3)
+
+    @parametrize("divisor", [1, 2])
+    @parametrize("scale", [1, 1024])
+    def test_modular_indexing_piecewise_base(self, divisor, scale):
+        x = sympy.Symbol("x", integer=True, positive=True)
+        base = scale * sympy.Piecewise((x, x < 10), (x + 1, True))
+        expr = ModularIndexing(base, divisor, 1024)
+
+        self.assertEqual(expr, ModularIndexing(base, divisor, 1024, evaluate=False))
+        self.assertEqual(expr.subs(x, 5), (scale * 5 // divisor) % 1024)
+        self.assertEqual(expr.subs(x, 15), (scale * 16 // divisor) % 1024)
+
+    def test_modular_indexing_piecewise_modulus(self):
+        x = sympy.Symbol("x", integer=True, positive=True)
+        modulus = sympy.Piecewise((x, x < 10), (x + 1, True))
+        expr = ModularIndexing(x, 1, modulus)
+
+        self.assertEqual(expr, ModularIndexing(x, 1, modulus, evaluate=False))
+        self.assertEqual(expr.subs(x, 5), 0)
+        self.assertEqual(expr.subs(x, 15), 15)
 
     def test_modular_indexing_positive(self):
         x = sympy.Symbol("x", integer=True, positive=True)
