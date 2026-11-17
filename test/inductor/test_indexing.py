@@ -464,31 +464,46 @@ class TestIndexingSimplification(InductorTestCase):
         w = sympy.Symbol("w", integer=True, positive=True)
         self.assertEqual(ModularIndexing(w, 1, w), 0)
 
+    @parametrize("divisor", [2, 3])
+    def test_modular_indexing_factored_period(self, divisor):
+        s, x, y = sympy.symbols("s x y", integer=True, positive=True)
+        expr = ModularIndexing(divisor * x * (s + 1) + y, divisor, s + 1)
+
+        self.assertEqual(expr, ModularIndexing(y, divisor, s + 1))
+
     def test_modular_indexing_fractional_period(self):
         w = sympy.Symbol("w", integer=True, positive=True)
         expr = ModularIndexing(w * (w + 1) / 2 + 1, 1, w)
 
         self.assertEqual(expr.subs(w, 4), 3)
 
+    @parametrize("value", [2, 4, 22, 44])
+    @parametrize("offset", [0, 1])
+    def test_modular_indexing_fractional_even_period(self, value, offset):
+        w = sympy.Symbol("w", integer=True, positive=True)
+        e = sympy.Symbol("e", even=True, positive=True)
+        expr = ModularIndexing(w * e / 22 + offset, 1, w)
+
+        self.assertEqual(expr.subs({w: 22, e: value}), (value + offset) % 22)
+
     @parametrize("divisor", [1, 2])
-    @parametrize("scale", [1, 1024])
-    def test_modular_indexing_piecewise_base(self, divisor, scale):
+    @parametrize("whole_period", [False, True])
+    def test_modular_indexing_piecewise_base(self, divisor, whole_period):
         x = sympy.Symbol("x", integer=True, positive=True)
+        scale = 1024 * divisor if whole_period else 1
         base = scale * sympy.Piecewise((x, x < 10), (x + 1, True))
         expr = ModularIndexing(base, divisor, 1024)
 
-        self.assertEqual(expr, ModularIndexing(base, divisor, 1024, evaluate=False))
         self.assertEqual(expr.subs(x, 5), (scale * 5 // divisor) % 1024)
         self.assertEqual(expr.subs(x, 15), (scale * 16 // divisor) % 1024)
 
     def test_modular_indexing_piecewise_modulus(self):
         x = sympy.Symbol("x", integer=True, positive=True)
-        modulus = sympy.Piecewise((x, x < 10), (x + 1, True))
-        expr = ModularIndexing(x, 1, modulus)
+        modulus = sympy.Piecewise((x, x < 10), (x + 1, True)) + 1
+        expr = ModularIndexing(x * modulus + 1, 1, modulus)
 
-        self.assertEqual(expr, ModularIndexing(x, 1, modulus, evaluate=False))
-        self.assertEqual(expr.subs(x, 5), 0)
-        self.assertEqual(expr.subs(x, 15), 15)
+        self.assertEqual(expr.subs(x, 5), 1)
+        self.assertEqual(expr.subs(x, 15), 1)
 
     def test_modular_indexing_positive(self):
         x = sympy.Symbol("x", integer=True, positive=True)
