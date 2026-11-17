@@ -598,6 +598,19 @@ class TestDecomp(TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
     longMessage = True
 
+    @dtypes(torch.float32, torch.float64)
+    def test_multilabel_margin_loss_unreduced_shape(self, device, dtype):
+        op = aten.multilabel_margin_loss_forward.default
+        decomp = decomposition_table[op]
+        for shape in [(), (5,), (1, 5), (3, 5)]:
+            with self.subTest(shape=shape):
+                input = make_tensor(shape, device=device, dtype=dtype)
+                target = torch.zeros(shape, device=device, dtype=torch.long)
+                actual = decomp(input, target, 0)
+                expected = op(input, target, 0)
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual[0].shape, expected[0].shape)
+
     # NB: This actually overlaps with test_comprehensive, but it only
     # runs on things that are definitely decomposed so it's a lot faster
     # to run
