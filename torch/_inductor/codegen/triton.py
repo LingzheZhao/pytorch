@@ -3587,6 +3587,12 @@ ARG_REDUCTION_TYPES = (
 PLAIN_REDUCTION_TYPES = ("sum", "prod", "max", "min", "xor_sum")
 
 
+def _max_autotune_reduction() -> bool:
+    if config.max_autotune_reduction is not None:
+        return config.max_autotune_reduction
+    return config.max_autotune_pointwise
+
+
 class TritonKernel(SIMDKernel[TritonCSEVariable]):
     """A class to represent a triton kernel and helpers to generate
     triton kernel programmatically
@@ -8024,6 +8030,7 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "incremental_autotune": config.incremental_autotune,
             "max_autotune": config.max_autotune,
             "max_autotune_pointwise": config.max_autotune_pointwise,
+            "max_autotune_reduction": _max_autotune_reduction(),
             "min_split_scan_rblock": config.triton.min_split_scan_rblock,
             "spill_threshold": config.triton.spill_threshold,
             "store_cubin": config.triton.store_cubin,
