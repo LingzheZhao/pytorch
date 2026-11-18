@@ -2374,14 +2374,9 @@ class triton:
         default=True,
     )
 
-    # limit tiling dimensions
-    #   - max_tiles=1 disables tiling
-    #   - max_tiles=2
-    #   - max_tiles=3 is experimental and may have bugs
-    # higher values are unsupported
-
-    #  We use a max of 3 if coalesce_tiling_analysis is True, and 2 otherwise.
-    #  Note - coalesce_tiling_analysis does not yet apply to dynamic shapes.
+    # Maximum tiling dimensions: combined pointwise/reduction count in coalescing
+    # analysis, or separate pointwise and reduction counts with prefer_nd_tiling.
+    # None uses the selection path's default. Higher values enable ND tiling.
     max_tiles: int | None = None
 
     # Prefer higher dimensional tilings. This simplifies indexing expressions, making
