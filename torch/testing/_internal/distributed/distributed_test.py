@@ -6779,9 +6779,17 @@ class DistributedTest:
 
             backend = os.environ["BACKEND"]
             if backend == "nccl":
-                # Case where rank != GPU device.
-                next_rank = (self.rank + 1) % int(self.world_size)
-                torch.cuda.set_device(next_rank)
+                # Case where rank != GPU device. nccl2 rejects tensors off the
+                # group's bound device, so only the legacy backend allows it.
+                pg = dist.distributed_c10d._get_default_group()
+                is_legacy = dist.distributed_c10d._NCCL_LEGACY_AVAILABLE and isinstance(
+                    pg._get_backend(torch.device("cuda")),
+                    dist.distributed_c10d.ProcessGroupNCCL,
+                )
+                device = self.rank
+                if is_legacy:
+                    device = (self.rank + 1) % int(self.world_size)
+                torch.cuda.set_device(device)
 
             # If GPU test, add object with GPU tensor
             if backend == "nccl":
