@@ -1356,7 +1356,8 @@ class TensorVariable(VariableTracker):
 
         source = TensorPropertySource(self.source, TensorProperty.STORAGE_OFFSET)
         install_guard(source.make_guard(GuardBuilder.EQUALS_MATCH))
-        return ConstantVariable.create(storage_offset, source=source)
+        # The guard pins the entry value, even if the graph later mutates the tensor.
+        return ConstantVariable.create(storage_offset)
 
     def _method_size_stride(
         self, name: str, dim: Any | None = None
