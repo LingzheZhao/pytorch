@@ -359,6 +359,31 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         fresh_globals[name] = object
         self.assertFalse(loaded.guard_check(x))
 
+    def _check_reloaded_guard(self, fn, initial, valid, invalid):
+        x = torch.ones(1)
+        compiled = _aot_compile(fn, x, *initial)
+        data = AOTCompiledFunction.serialize(compiled).serialized_data
+        loaded = AOTCompiledFunction.deserialize(data, guard_globals=globals())
+        self.assertTrue(loaded.guard_check(x, *valid))
+        self.assertEqual(loaded(x, *valid), fn(x, *valid))
+        self.assertFalse(loaded.guard_check(x, *invalid))
+
+    def test_native_method_receiver_alias_guard_survives_serialization(self):
+        def compare(x, left, right):
+            return x + (list.count.__get__(left) == list.count.__get__(right))
+
+        left, right = [], []
+        self._check_reloaded_guard(compare, ([], []), (left, right), (left, left))
+
+    def test_native_method_descriptor_guard_survives_serialization(self):
+        def metadata(x, method):
+            return x + 1, method.__qualname__
+
+        receiver = collections.OrderedDict()
+        base = dict.__setitem__.__get__(receiver)
+        derived = type(receiver).__setitem__.__get__(receiver)
+        self._check_reloaded_guard(metadata, (base,), (base,), (derived,))
+
     def test_constant_mro_length_changed_before_reload(self):
         x = torch.ones(1)
         compiled = _aot_compile(_constant_mro_length, x)
@@ -717,7 +742,7 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         control_state, _ = _kept_types(control)
         # The kept keys-match is all that tells the two artifacts' guards apart
         # beyond the identity guards on objects a load resolves by reference
-        # (G['pytree'], two of its classes and torch), which the pre-check's type
+        # (G['pytree'], its referenced classes and torch), which the pre-check's type
         # tests drop. Counted per type, because a set of type names hides a
         # second divergence in a type that keeps another instance.
         self.assertIn("DICT_KEYS_MATCH", kept)
@@ -727,12 +752,11 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         control_counts = collections.Counter(
             g.create_fn_name() for g in control_state.output_graph.guards
         )
-        # pytree's classes are TreeSpec and typing.Any, which is a class only
-        # from Python 3.11 on; before that it is a _SpecialForm, guarded by an
-        # ID_MATCH that is kept because it pickles as the global typing.Any.
+        # Class matches protect the tensor type, TreeSpec, its MRO base and typing.Any.
+        # The two torch imports are guarded by identity. Before Python 3.11,
+        # typing.Any is also guarded by identity because it is a _SpecialForm.
         any_is_class = isinstance(pytree.Any, type)
-        # The object entry in TreeSpec's MRO also needs a class identity guard.
-        class_matches, id_matches = (3, 2) if any_is_class else (2, 3)
+        class_matches, id_matches = (4, 2) if any_is_class else (3, 3)
         self.assertEqual(
             counts - control_counts,
             {

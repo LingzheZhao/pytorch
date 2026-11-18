@@ -63,6 +63,7 @@ from torch.testing._internal.triton_utils import (
 
 
 nested_compile_region = torch.compiler.nested_compile_region
+_shape_bucket = {4: 0, 8: 1}.get
 
 if HAS_GPU:
     import triton
@@ -3667,6 +3668,26 @@ class TestInvokeSubgraphCompileCUDA(TestCase):
 class TestInvokeSubgraphReuse(TestCase):
     hw_classification = HardwareClassification.GENERIC
 
+    def test_method_receiver_alias_guards_retrace(self):
+        class Pair:
+            def __init__(self, left, right):
+                self.left, self.right = left, right
+
+        @nested_compile_region
+        def region(x, pair):
+            return x + (list.count.__get__(pair.left) == list.count.__get__(pair.right))
+
+        def fn(x, first, second):
+            return region(x, first) + region(x, second)
+
+        x, shared = torch.ones(1), []
+        first, second = Pair([], []), Pair(shared, shared)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        with self._count_speculate_calls() as count:
+            result = compiled(x, first, second)
+        self.assertEqual(result, 2 * x + 1)
+        self.assertEqual(count(), 2)
+
     @contextlib.contextmanager
     def _count_speculate_calls(self):
         count = 0
@@ -6034,7 +6055,7 @@ class TestInvokeSubgraphReuseHashFn(TestCase):
         """Hash fn that uses tensor shape to differentiate inputs."""
 
         def hash_fn(x):
-            return x.shape[0]
+            return _shape_bucket(x.shape[0])
 
         @nested_compile_region(reuse_hash_fn=hash_fn)
         def gn(x):

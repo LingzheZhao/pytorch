@@ -2085,6 +2085,11 @@ class BuiltinVariable(BaseBuiltinVariable):
             # CPython (returns NotImplemented rather than falling back to the
             # reflected operation when the operands are incompatible).
             lval = args[0].as_python_constant()
+            if self.fn is object and name == "__eq__":
+                same = vt_identity_compare(args[0], args[1])
+                if same is not None:
+                    result = same.as_python_constant() or NotImplemented
+                    return ConstantVariable.create(result)
             if isinstance(lval, self.fn):
                 return ConstantVariable.create(
                     getattr(self.fn, name)(lval, args[1].as_python_constant())
@@ -3261,7 +3266,7 @@ class BuiltinVariable(BaseBuiltinVariable):
         *args: VariableTracker,
         **kwargs: VariableTracker,
     ) -> VariableTracker:
-        format_string = _format_string.as_python_constant()
+        format_string = _format_string.guard_as_python_constant()
         format_string = str(format_string)
         return StringFormatVariable.create(tx, format_string, list(args), kwargs)
 
@@ -3649,6 +3654,8 @@ class DictBuiltinVariable(BaseBuiltinVariable):
         resolved_fn = getattr(dict, name, None)
         if resolved_fn is not None and resolved_fn in dict_methods:
             obj = args[0].realize()
+            if isinstance(obj, ConstDictVariable):
+                obj.check_base_dict_mutation(tx, name)
             if name == "__repr__":
                 if not isinstance(obj, ConstDictVariable):
                     unimplemented(
