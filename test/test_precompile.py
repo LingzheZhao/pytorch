@@ -937,7 +937,6 @@ class TestPrecompile(TestCase):
             backend_id: EagerCacheArtifact(key=backend_id, content=backend)
             for backend_id, backend in package.cached_backends.items()
         }
-        torch._dynamo.reset()
         binding = {"defaults": step.__defaults__, "kwdefaults": step.__kwdefaults__}
         # torch: an artifact-namespace name the captured module also binds; the
         # module's binding is the one the rebuilt bytecode must LOAD_GLOBAL.
@@ -948,6 +947,7 @@ class TestPrecompile(TestCase):
         # and sends the user to a fresh process (which the scrub below stands for).
         with self.assertRaisesRegex(PrecompileError, "fresh process"):
             build()
+        torch._dynamo.reset()
         scope = step.__globals__
         scrub = self._scrub_minted(scope)
         forward = build()
