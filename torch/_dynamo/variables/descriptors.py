@@ -312,6 +312,9 @@ class MethodWrapperVariable(VariableTracker):  # noqa: RVT001
         obj_value = self.obj.as_python_constant()
         return self._bind_python_constant(obj_value)
 
+    def can_load_const_for_codegen(self) -> bool:
+        return False
+
     def call_function(
         self,
         tx: "InstructionTranslatorBase",
@@ -651,6 +654,9 @@ class BoundBuiltinMethodVariable(VariableTracker):  # noqa: RVT001
     def as_python_constant(self) -> Any:
         return self._bind_python_constant(self.obj.as_python_constant())
 
+    def can_load_const_for_codegen(self) -> bool:
+        return False
+
     def call_function(
         self,
         tx: "InstructionTranslatorBase",
@@ -902,6 +908,9 @@ class StaticMethodVariable(VariableTracker):
     def as_python_constant(self) -> staticmethod:  # type: ignore[type-arg]
         return staticmethod(self.descriptor.as_python_constant())
 
+    def can_load_const_for_codegen(self) -> bool:
+        return False
+
     def lookup_instance_dict(
         self, tx: "InstructionTranslatorBase", name: str
     ) -> VariableTracker | None:
@@ -988,6 +997,9 @@ class ClassMethodVariable(VariableTracker):
 
     def as_python_constant(self) -> classmethod:  # type: ignore[type-arg]
         return classmethod(self.descriptor.as_python_constant())
+
+    def can_load_const_for_codegen(self) -> bool:
+        return False
 
     def lookup_instance_dict(
         self, tx: "InstructionTranslatorBase", name: str
