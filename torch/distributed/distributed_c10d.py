@@ -449,11 +449,17 @@ try:
 except ImportError:
     _MPI_AVAILABLE = False
 
+# The legacy ProcessGroupNCCL ("nccl-legacy") is only built internally; in OSS
+# ProcessGroupNCCL is an alias of ProcessGroupNCCL2.
+_NCCL_LEGACY_AVAILABLE = False
 try:
     from torch._C._distributed_c10d import ProcessGroupNCCL
 
     ProcessGroupNCCL.__module__ = "torch.distributed.distributed_c10d"
     __all__ += ["ProcessGroupNCCL"]
+    _NCCL_LEGACY_AVAILABLE = ProcessGroupNCCL is not getattr(
+        torch._C._distributed_c10d, "ProcessGroupNCCL2", None
+    )
 except ImportError:
     _NCCL_AVAILABLE = False
 
@@ -979,7 +985,7 @@ def _register_builtin_gloo_backend() -> None:
 def _register_builtin_nccl_backend() -> None:
     creator_fn = (
         _create_nccl_process_group
-        if os.environ.get("TORCH_DIST_USE_NCCL2") == "0"
+        if _NCCL_LEGACY_AVAILABLE and os.environ.get("TORCH_DIST_USE_NCCL2") == "0"
         else _create_nccl2_process_group
     )
     # Record what "nccl" actually resolved to for _maybe_attach_flight_recorder,
@@ -1002,6 +1008,8 @@ def _register_builtin_nccl_backend() -> None:
 
 
 def _register_builtin_nccl_legacy_backend() -> None:
+    if not _NCCL_LEGACY_AVAILABLE:
+        return
     Backend.register_backend(
         "nccl-legacy",
         _create_nccl_process_group,
@@ -1012,6 +1020,9 @@ def _register_builtin_nccl_legacy_backend() -> None:
 
 
 def _register_builtin_nccl_as_legacy() -> None:
+    if not _NCCL_LEGACY_AVAILABLE:
+        _register_builtin_nccl_backend()
+        return
     _FR_SELF_RECORDING_BACKENDS.add(Backend.NCCL)
     Backend.register_backend(
         Backend.NCCL,
@@ -2333,7 +2344,7 @@ def _get_process_group_uid(pg: ProcessGroup) -> int:
         )
     except RuntimeError:
         pass
-    if is_nccl_available() and isinstance(backend, ProcessGroupNCCL):
+    if _NCCL_LEGACY_AVAILABLE and isinstance(backend, ProcessGroupNCCL):
         return backend.uid
     return -1
 

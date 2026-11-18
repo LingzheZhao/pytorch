@@ -38,6 +38,7 @@ from torch.testing._internal.common_distributed import (
     MultiProcContinuousTest,
     MultiProcessTestCase,
     MultiThreadedTestCase,
+    requires_nccl_legacy,
     skip_if_lt_x_gpu,
 )
 from torch.testing._internal.common_utils import (
@@ -592,7 +593,7 @@ class BackendEntryPointTest(TestCase):
 
         expected_creator = (
             c10d._create_nccl_process_group
-            if nccl2_override == "0"
+            if nccl2_override == "0" and c10d._NCCL_LEGACY_AVAILABLE
             else c10d._create_nccl2_process_group
         )
         self.assertIs(
@@ -619,6 +620,7 @@ class BackendEntryPointTest(TestCase):
             os.environ.pop("LOCAL_RANK", None)
             self.assertEqual(c10d._nccl2_device(opts), torch.device("cuda:3"))
 
+    @requires_nccl_legacy()
     def test_nccl_legacy_backend_registration(self):
         c10d._register_builtin_nccl_legacy_backend()
 
