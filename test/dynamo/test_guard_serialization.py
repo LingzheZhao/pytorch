@@ -1,5 +1,6 @@
 # Owner(s): ["module: dynamo"]
 
+import abc
 import builtins
 import cmath
 import collections
@@ -953,10 +954,204 @@ class LockHolder:
         self.lock = threading.Lock()
 
 
+class _ABCHolder(metaclass=abc.ABCMeta):  # noqa: B024 - exercise a concrete ABCMeta instance
+    def __init__(self, opts):
+        self.opts = opts
+        self.unused = threading.Lock()
+
+
+class DictionaryToken:
+    pass
+
+
+class TokenConsumer:
+    def __init__(self, token):
+        if not isinstance(token, DictionaryToken):
+            raise TypeError("TokenConsumer requires a DictionaryToken")
+        self.token = token
+
+    def __reduce_ex__(self, protocol):
+        return type(self), (self.token,)
+
+
+class _PayloadConsumer(TokenConsumer):
+    def __init__(self, token):
+        super().__init__(token)
+        self.scale = 2
+        if token.payload != ["required"]:
+            raise ValueError("Missing constructor payload")
+
+
+class _RegisteredPayloadConsumer(_PayloadConsumer):
+    __reduce_ex__ = object.__reduce_ex__
+
+
+class _DynamicStateConsumer(_RegisteredPayloadConsumer):
+    def __getattr__(self, name):
+        if name == "__setstate__":
+            return self.restore
+        raise AttributeError(name)
+
+    def restore(self, state):
+        self.__init__(state["token"])
+
+
+class _PayloadToken(DictionaryToken):
+    def __bool__(self):
+        return self.payload == ["required"]
+
+
+_PayloadRecord = collections.namedtuple("_PayloadRecord", ["token"])
+_tuple_new = tuple.__new__
+
+
+class _PayloadNewConsumer(_PayloadRecord):
+    def __new__(cls, token):
+        return _tuple_new(cls, (token or None,))
+
+    scale = property(lambda self: self.token.scale)
+
+
+class SlottedTokenConsumer(TokenConsumer):
+    __slots__ = ("token",)
+
+
+class DefaultSlottedTokenConsumer:
+    __slots__ = ("token",)
+
+    def __init__(self, token):
+        self.token = token
+
+    def __setattr__(self, name, value):
+        if name == "token" and not isinstance(value, DictionaryToken):
+            raise TypeError("DefaultSlottedTokenConsumer requires a DictionaryToken")
+        object.__setattr__(self, name, value)
+
+
+class InstanceReducedDict(dict):
+    def __init__(self, token):
+        if not isinstance(token, DictionaryToken):
+            raise TypeError("InstanceReducedDict requires a DictionaryToken")
+        super().__init__(token=token)
+
+
+class DictionaryProtocolMeta(type):
+    def __getattribute__(cls, name):
+        if name in ("__reduce__", "__reduce_ex__"):
+            return getattr(object, name)
+        return super().__getattribute__(name)
+
+
+class ClassReducedDict(InstanceReducedDict):
+    def __reduce_ex__(self, protocol):
+        return type(self), (self["token"],)
+
+
+class ReduceDictionary(InstanceReducedDict):
+    def __reduce__(self):
+        return type(self), (self["token"],)
+
+
+class MetaclassReducedDict(ClassReducedDict, metaclass=DictionaryProtocolMeta):
+    pass
+
+
+class _ProtocolPropertyMeta(type):
+    __reduce__ = property(lambda cls: object.__reduce__)
+    __reduce_ex__ = property(lambda cls: object.__reduce_ex__)
+
+
+class _PropertyReducedDict(ClassReducedDict, metaclass=_ProtocolPropertyMeta):
+    pass
+
+
+class _NamespaceMeta(type):
+    def __getattribute__(cls, name):
+        namespace = super().__getattribute__(name)
+        if name == "__dict__":
+            namespace = dict(namespace)
+            namespace["__reduce_ex__"] = object.__reduce_ex__
+        return namespace
+
+
+class _NamespaceMetaDict(ClassReducedDict, metaclass=_NamespaceMeta):
+    pass
+
+
+class NamespaceReducedDict(InstanceReducedDict):
+    @property
+    def __dict__(self):
+        return {}
+
+
+class PlainNamespaceDict(dict):
+    pass
+
+
+class GenericGetattrDict(collections.defaultdict):
+    # Retain defaultdict's distinct wrapper for PyObject_GenericGetAttr.
+    __new__ = dict.__new__
+    __init__ = dict.__init__
+    __reduce__ = object.__reduce__
+    __reduce_ex__ = object.__reduce_ex__
+
+
+class SlottedDictionary(dict):
+    __slots__ = ("tag",)
+
+
+class InheritedNamespaceReducedDict(PlainNamespaceDict, NamespaceReducedDict):
+    pass
+
+
+class DictionaryReducerDescriptor:
+    def __get__(self, owner, cls=None):
+        if owner is None:
+            return object.__reduce_ex__
+        return functools.partial(ClassReducedDict.__reduce_ex__, owner)
+
+
+class DescriptorReducedDict(InstanceReducedDict):
+    __reduce_ex__ = DictionaryReducerDescriptor()
+
+
 class LockDict(dict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.lock = threading.Lock()
+
+
+class _MappingCallable:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.payload = cfg["token"].value
+
+    def __call__(self):
+        return self.payload
+
+    def __reduce__(self):
+        return type(self), (self.cfg,)
+
+
+class _SlottedMappingHolder:
+    __slots__ = ("cfg", "loss")
+
+
+class _ReducedModule(torch.nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.loss = _MappingCallable(cfg)
+
+    __reduce__ = _MappingCallable.__reduce__
+
+
+class _StateHolder(_ABCHolder):
+    def __getstate__(self):
+        return {"opts": self.opts}
+
+    def __setstate__(self, state):
+        self.opts = state["opts"]
 
 
 class ReducedHolder:
@@ -999,6 +1194,10 @@ class _Stage:
 
     def __hash__(self):
         return hash(self.lr)
+
+
+class _SlottedStage(_Stage):
+    __slots__ = ("steps",)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1572,7 +1771,25 @@ class _ODictSubclass(collections.OrderedDict):
     def __setattr__(self, name, value):
         if name == "__dict__":
             raise AssertionError("State restoration must bypass __setattr__")
+        if name == "slot" and isinstance(dict.get(self, "b"), _Missing):
+            raise AssertionError("Slot restoration must retain dictionary values")
         super().__setattr__(name, value)
+
+
+class _DictStateLookup(dict):
+    def __getattribute__(self, name):
+        if name == "__setstate__" and isinstance(dict.get(self, "b"), _Missing):
+            raise AssertionError("State lookup must retain dictionary values")
+        return object.__getattribute__(self, name)
+
+
+class _DictStateGetattr(dict):
+    __getattr__ = _DictStateLookup.__getattribute__
+
+
+class _ODictNoKeys(_ODictSubclass):
+    def keys(self):
+        raise AssertionError("State traversal must bypass keys overrides")
 
 
 class _NormalizingODict(collections.OrderedDict):
@@ -1647,6 +1864,167 @@ class _ODictSlotsState(_ODictSubclass):
 
 @instantiate_parametrized_tests
 class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
+    def _roundtrip_pruned(self, scope, dictionaries, *tracked):
+        buf = io.BytesIO()
+        tracked = (*scope.values(), *tracked)
+        pickler = GuardsStatePickler({id(v): v for v in tracked}, {}, {}, {}, buf)
+        pickler.prune_scopes(scope, {}, dictionaries)
+        pickler.dump(scope)
+        return load_guards_state(buf.getvalue())
+
+    @parametrize(
+        "mapping_type",
+        [
+            dict,
+            PlainNamespaceDict,
+            GenericGetattrDict,
+            collections.OrderedDict,
+            collections.defaultdict,
+        ],
+    )
+    @parametrize(
+        "key,consumer_type",
+        [
+            (_Mode.FAST, ClassReducedDict),
+            ((_Mode.FAST,), TokenConsumer),
+            (frozenset({_Mode.FAST}), SlottedTokenConsumer),
+            (_Stage(2, [_Mode.FAST]), DefaultSlottedTokenConsumer),
+            (_SlottedStage(2, [_Mode.FAST]), TokenConsumer),
+        ],
+    )
+    @parametrize("mapping_first", [False, True])
+    def test_pruned_dictionary_preserves_key_and_constructor_state(
+        self, mapping_type, consumer_type, key, mapping_first
+    ):
+        token = DictionaryToken()
+        token.payload = ["saved"]
+        unused = mapping_type(
+            key_alias=_Mode.FAST, constructor_alias=token, lock=threading.Lock()
+        )
+        keyed = {key: "saved"}
+        scope = {"unused": unused, "keyed": keyed, "consumer": consumer_type(token)}
+        if not mapping_first:
+            scope = dict(reversed(scope.items()))
+        saved = self._roundtrip_pruned(scope, [unused, keyed], key)
+        consumer = saved["consumer"]
+        loaded_token = (
+            consumer["token"] if isinstance(consumer, dict) else consumer.token
+        )
+        self.assertEqual(loaded_token.payload, ["saved"])
+        self.assertEqual(saved["keyed"], keyed)
+        self.assertIs(saved["unused"]["constructor_alias"], loaded_token)
+        self.assertIs(saved["unused"]["key_alias"], _Mode.FAST)
+        self.assertIsInstance(saved["unused"]["lock"], _Missing)
+
+    def test_by_value_function_keeps_constructor_mapping(self):
+        helpers = [DictionaryToken() for _ in range(4)]
+        mappings = [{"token": DictionaryToken()} for _ in helpers]
+        for i, (helper, cfg) in enumerate(zip(helpers, mappings)):
+            cfg["token"].value = i
+            helper.loss = _MappingCallable(cfg)
+        closure, default, keyword, attribute = helpers
+
+        def fn(pos=default, *, kw=keyword):
+            return closure, pos, kw
+
+        fn.helper = attribute
+        saved = self._roundtrip_pruned({"cfgs": mappings, "fn": fn}, mappings, *helpers)
+        for i, item in enumerate((*saved["fn"](), saved["fn"].helper)):
+            self.assertIs(item.loss.cfg, saved["cfgs"][i])
+            self.assertEqual(item.loss(), i)
+
+    def test_mapping_proxy_snapshot_prunes_unrelated_token(self):
+        token = DictionaryToken()
+        cfg = {"token": token}
+        proxy = types.MappingProxyType({"consumer": TokenConsumer(token)})
+        saved = self._roundtrip_pruned({"cfg": cfg, "proxy": proxy}, [cfg])
+        self.assertIsInstance(saved["cfg"]["token"], _Missing)
+        self.assertIsInstance(saved["proxy"]["consumer"].token, DictionaryToken)
+
+    @parametrize("token_live", [False, True])
+    def test_mapping_proxy_keeps_only_its_copied_state(self, token_live):
+        token = DictionaryToken()
+        token.value, token.payload = 3, ["required"]
+        cfg = {"token": token}
+        backing = ClassReducedDict(token)
+        backing["loss"] = _MappingCallable(cfg)
+        unused = {"lock": threading.Lock(), "proxy": types.MappingProxyType(backing)}
+        backing.private = unused
+        proxy = types.MappingProxyType(backing)
+        scope = {"cfg": cfg, "unused": unused, "get": proxy.get, "proxy": proxy}
+        saved = self._roundtrip_pruned(scope, [cfg, unused])
+        self.assertIs(saved["get"].__self__, saved["proxy"])
+        self.assertIs(saved["get"]("loss").cfg, saved["cfg"])
+        self.assertIsInstance(saved["unused"]["lock"], _Missing)
+        backing.copy = mock.Mock(
+            side_effect=lambda: {
+                "nested": [
+                    TokenConsumer(token) if token_live else _MappingCallable(cfg)
+                ],
+                "rank": backing.copy.call_count,
+            }
+        )
+        if token_live:
+            scope = {"token": token, **scope}
+        scope["second"] = types.MappingProxyType(backing)
+        with self.assertRaisesRegex(PackageError, "mapping proxy copy"):
+            self._roundtrip_pruned(scope, [cfg, unused])
+        backing.copy.assert_called_once_with()
+        backing.copy.reset_mock()
+        saved = self._roundtrip_pruned(scope, [cfg, unused], token, token.payload)
+        self.assertEqual((saved["proxy"]["rank"], saved["second"]["rank"]), (1, 2))
+        consumer = saved["get"]("nested")[0]
+        if token_live:
+            self.assertIs(consumer.token, saved["cfg"]["token"])
+        else:
+            self.assertIs(consumer.cfg, saved["cfg"])
+        self.assertEqual(backing.copy.call_count, 2)
+
+    def test_dictionary_pruning_does_not_call_metaclass_equality(self):
+        class Meta(type):
+            def __eq__(cls, other):
+                raise AssertionError("Pickle protocol lookup must not compare classes")
+
+            def __hash__(cls):
+                return hash(PlainNamespaceDict)
+
+        class Mapping(dict, metaclass=Meta):
+            pass
+
+        mapping, plain = Mapping(), PlainNamespaceDict()
+        pickler = GuardsStatePickler({}, {}, {}, {}, io.BytesIO())
+        with mock.patch.dict(copyreg.dispatch_table, {Mapping: tuple}):
+            pickler.prune_scopes({}, {}, [mapping, plain])
+        self.assertNotIn(id(mapping), pickler._pruned_dictionary_ids)
+        self.assertIn(id(plain), pickler._pruned_dictionary_ids)
+
+    def test_pruned_dictionary_preserves_recursive_and_repeated_references(self):
+        value = {"bystander": threading.Lock()}
+        value["self"] = value
+        helper = ReducedHolder(2, {})
+        helper.cfg = value
+        # A registered globals dict omitted from the saved scopes is not a pickle root.
+        saved = self._roundtrip_pruned(
+            {"left": value, "right": value}, [value], {"helper": helper}
+        )
+        left, right = saved.values()
+        self.assertIs(left, right)
+        self.assertIs(left["self"], left)
+        self.assertIsInstance(left["bystander"], _Missing)
+
+    def test_required_state_traversal_does_not_read_class_property(self):
+        class Key:
+            @property
+            def __class__(self):
+                raise AssertionError("Required-state traversal must not read __class__")
+
+        key = Key()
+        key.state = [{"saved": _Mode.FAST}]
+        pickler = GuardsStatePickler({id(key): key}, {}, {}, {}, io.BytesIO())
+        pickler._retain_required_state({key: "saved"})
+        for value in (key, key.state, key.state[0], _Mode.FAST):
+            self.assertIs(pickler._whole_compared_values[id(value)], value)
+
     hw_classification = HardwareClassification.GENERIC
 
     class NestedOrderedDict(collections.OrderedDict):
@@ -3236,6 +3614,172 @@ class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
 @torch._dynamo.config.patch({"strict_precompile": True})
 @instantiate_parametrized_tests
 class TestGuardSerialization(TestGuardSerializationBase):
+    @property
+    def _saved_scope(self):
+        return load_guards_state(self._cached_guards_state).output_graph.local_scope
+
+    def _roundtrip_checks(self, kinds, fn, inputs):
+        managers = self._test_serialization(kinds, fn, **inputs)
+        check = functools.partial(self._test_check_fn, *managers)
+        check(inputs, True)
+        return check
+
+    @parametrize("helper_type", [DictionaryToken, ReducedHolder, TokenConsumer])
+    @parametrize("mapping_type", [dict, collections.defaultdict])
+    def test_dictionary_snapshot_constructor_aliases(self, helper_type, mapping_type):
+        def fn(x, holder):
+            return x + len(tuple(holder.cfg)) + holder.items[1]
+
+        holder = DictionaryToken()
+        passive = helper_type is DictionaryToken
+        token = threading.Lock() if passive else DictionaryToken()
+        holder.cfg = mapping_type()
+        holder.cfg["token"] = token
+        if helper_type is TokenConsumer:
+            helper = TokenConsumer(token)
+        else:
+            helper = DictionaryToken() if passive else ReducedHolder(2, {})
+            helper.cfg = holder.cfg
+        holder.items = [helper, 5]
+        inputs = {"x": torch.ones(1), "holder": holder}
+        kinds = ("DICT_KEYS_MATCH", "SEQUENCE_LENGTH", "CONSTANT_MATCH")
+        check = self._roundtrip_checks(kinds, fn, inputs)
+        holder.items[1] += 1
+        check(inputs, False)
+        loaded = self._saved_scope["holder"]
+        if helper_type is ReducedHolder:
+            self.assertIsInstance(loaded.cfg["token"], DictionaryToken)
+            self.assertIs(loaded.items[0].cfg["token"], loaded.cfg["token"])
+        else:
+            self.assertIsInstance(loaded.cfg["token"], _Missing)
+            if helper_type is TokenConsumer:
+                self.assertIsInstance(loaded.items[0].token, DictionaryToken)
+            else:
+                self.assertIs(loaded.items[0].cfg, loaded.cfg)
+
+    @parametrize(
+        "kind", ["object", "slots", "namespace", "module", "reduce", "bound", "builtin"]
+    )
+    def test_callable_attribute_keeps_constructor_mapping(self, kind):
+        def fn(x, holder):
+            return x + len(tuple(holder.cfg))
+
+        token = DictionaryToken()
+        token.value = 3
+        cfg = {"token": token}
+        if kind == "reduce":
+            holder = _ReducedModule(cfg)
+        else:
+            holder = {
+                "slots": _SlottedMappingHolder,
+                "namespace": types.SimpleNamespace,
+                "module": torch.nn.Module,
+            }.get(kind, DictionaryToken)()
+            holder.cfg = cfg
+            loss = _MappingCallable(cfg)
+            holder.loss = {"bound": loss.__call__, "builtin": [loss].pop}.get(
+                kind, loss
+            )
+        inputs = {"x": torch.ones(1), "holder": holder}
+        check = self._roundtrip_checks("DICT_KEYS_MATCH", fn, inputs)
+        saved = self._saved_scope["holder"]
+        loss = saved.loss.__self__ if kind == "bound" else saved.loss
+        if kind == "builtin":
+            loss = loss()
+        self.assertIs(saved.cfg, loss.cfg)
+        self.assertEqual(loss(), 3)
+        cfg["extra"] = 1
+        check(inputs, False)
+
+    def test_local_dictionary_prunes_nested_bystanders(self):
+        def fn(x, cfg, keyed, items):
+            offset = cfg["inner"]["guarded"] + cfg["opts"][0]
+            return x + offset + len(tuple(keyed)) + items[1]
+
+        cfg = {
+            "inner": {"guarded": 3, "lock": threading.Lock()},
+            "alias": _Mode.FAST,
+            "opts": [4, threading.Lock()],
+        }
+        # The discarded list element is the only constructor that could read
+        # the shared mapping in full. Its presence must not retain either lock.
+        helper = ReducedHolder(2, {})
+        helper.cfg = cfg
+        inputs = {
+            "x": torch.ones(1),
+            "cfg": cfg,
+            "keyed": {_Mode.FAST: 0},
+            "items": [helper, 5],
+        }
+        check = self._roundtrip_checks(
+            ("DICT_KEYS_MATCH", "CONSTANT_MATCH"), fn, inputs
+        )
+        scope = self._saved_scope
+        saved = scope["cfg"]
+        self.assertIs(saved["alias"], next(iter(scope["keyed"])))
+        check({**inputs, "keyed": {_Mode.SLOW: 0}}, False)
+        self.assertIsInstance(saved["inner"]["lock"], _Missing)
+        self.assertIsInstance(saved["opts"][1], _Missing)
+        self.assertIsInstance(scope["items"][0], _Missing)
+        cfg["inner"]["guarded"] += 1
+        check(inputs, False)
+
+    @parametrize(
+        "consumer_type",
+        [
+            _PayloadConsumer,
+            _PayloadNewConsumer,
+            _RegisteredPayloadConsumer,
+            _DynamicStateConsumer,
+        ],
+    )
+    def test_custom_constructor_keeps_independently_guarded_arguments(
+        self, consumer_type
+    ):
+        def fn(x, consumer, token):
+            return x + consumer.scale + token.scale
+
+        token = _PayloadToken()
+        token.payload = ["required"]
+        token.scale = 3
+        consumer = consumer_type(token)
+        inputs = {"x": torch.ones(1), "consumer": consumer, "token": token}
+        with mock.patch.dict(
+            copyreg.dispatch_table,
+            {_RegisteredPayloadConsumer: lambda obj: (type(obj), (obj.token,))},
+        ):
+            check = self._roundtrip_checks("CONSTANT_MATCH", fn, inputs)
+        token.scale += 1
+        check(inputs, False)
+
+    @parametrize("root_type", [_ABCHolder, _Cfg, SlottedDictionary, _StateHolder])
+    def test_nested_guarded_state_under_protocol_root(self, root_type):
+        def fn(x, holder):
+            opt = holder["opts"] if isinstance(holder, dict) else holder.opts
+            return x + opt.scale
+
+        opt = LockHolder(2)
+        if root_type is SlottedDictionary:
+            holder = root_type(opts=opt)
+            holder.tag = "saved"
+        else:
+            holder = root_type(opt)
+        inputs = {"x": torch.ones(1), "holder": holder}
+        kinds = ("TYPE_MATCH", "CONSTANT_MATCH", "TENSOR_MATCH")
+        if root_type is _StateHolder:
+            # An arbitrary setter can inspect its child, as _DynamicStateConsumer does.
+            with self.assertRaisesRegex(PackageError, "cannot pickle.*lock"):
+                self._test_serialization(kinds, fn, *inputs.values())
+            return
+        check = self._roundtrip_checks(kinds, fn, inputs)
+        opt.scale += 1
+        check(inputs, False)
+        if root_type is SlottedDictionary:
+            saved = self._saved_scope["holder"]
+            self.assertEqual(saved.tag, "saved")
+            self.assertEqual(saved["opts"].scale, 2)
+            self.assertIsInstance(saved["opts"].lock, _Missing)
+
     @parametrize("skip_dependency", [False, True])
     def test_native_receiver_alias_dependencies(self, skip_dependency):
         def install_alias_guard(ctx):
@@ -4503,6 +5047,78 @@ class TestGuardSerialization(TestGuardSerializationBase):
         self._test_check_fn(ref, loaded, inputs([4, 4]), True)
         self._test_check_fn(ref, loaded, inputs([8, 8]), False)
 
+    @parametrize("inner_tensor", [False, True])
+    @parametrize("via_holder", [False, True])
+    @parametrize("tensor_guard", [False, True])
+    def test_implicit_order_alias_keeps_ancestors_and_metadata(
+        self, inner_tensor, via_holder, tensor_guard
+    ):
+        def fn(holder, module, x):
+            mapping = holder.cfg if via_holder else module.mapping
+            return (
+                x
+                + len(tuple(mapping))
+                + len(tuple(module.mapping))
+                + hasattr(module, "mapping")
+                + hasattr(holder, "cfg")
+            )
+
+        def inputs(blocks):
+            module = torch.nn.Module()
+            x = SubclassWithMeta(torch.ones(3), extra=blocks)
+            module.mapping = {
+                "unused": x.a if inner_tensor else blocks,
+                "lock": threading.Lock(),
+            }
+            holder = LockHolder(2)
+            holder.cfg = module.mapping
+            return {"holder": holder, "module": module, "x": x}
+
+        kinds = ["HASATTR", "TENSOR_SUBCLASS_METADATA_MATCH"]
+        if tensor_guard:
+            kinds.append("TENSOR_MATCH")
+        check = self._roundtrip_checks(kinds, fn, inputs([4, 4]))
+        check(inputs([8, 8]), False)
+        invalid = inputs([4, 4])
+        del invalid["module"].mapping
+        check(invalid, False)
+        state = load_guards_state(self._cached_guards_state).output_graph
+        source = "L['holder'].cfg" if via_holder else "L['module'].mapping"
+        self.assertIn(source, {s.name for s in state.guard_on_key_order})
+        self.assertIs(
+            state.local_scope["holder"].cfg, state.local_scope["module"].mapping
+        )
+        self.assertIsInstance(state.local_scope["holder"].lock, _Missing)
+
+    @parametrize(
+        "mapping_type",
+        [_ODictSubclass, _ODictNoKeys, _DictStateLookup, _DictStateGetattr],
+    )
+    def test_implicit_dictionary_bystander_keeps_shared_subclass_state(
+        self, mapping_type
+    ):
+        def fn(x, owner, other):
+            return x + len(owner), tuple(other)
+
+        def inputs():
+            shared = ["saved"]
+            owner = mapping_type(a=1, b=shared)
+            owner.tag = "saved"
+            owner.slot = owner
+            return {"x": torch.ones(1), "owner": owner, "other": {"unused": shared}}
+
+        kinds = ("TYPE_MATCH", "DICT_KEYS_MATCH", "TENSOR_MATCH")
+        check = self._roundtrip_checks(kinds, fn, inputs())
+        invalid = inputs()
+        invalid["other"] = {"changed": invalid["other"]["unused"]}
+        check(invalid, False)
+        state = load_guards_state(self._cached_guards_state).output_graph
+        owner = state.local_scope["owner"]
+        self.assertEqual(owner["b"], ["saved"])
+        self.assertIs(owner["b"], state.local_scope["other"]["unused"])
+        self.assertIs(owner.slot, owner)
+        self.assertEqual(owner.tag, "saved")
+
     def test_tensor_subclass_ctx_dict_key_is_kept_whole(self):
         def fn(x, stage):
             return x * stage.lr
@@ -4576,6 +5192,70 @@ class TestGuardSerialization(TestGuardSerializationBase):
         )
         self._test_check_fn(ref, loaded, inputs(3), True)
         self._test_check_fn(ref, loaded, inputs(4), False)
+
+    @parametrize("iterate", [False, True])
+    @parametrize(
+        "mapping_type",
+        [
+            dict,
+            LockDict,
+            collections.OrderedDict,
+            functools.partial(collections.defaultdict, list),
+        ],
+    )
+    def test_dictionary_keys_prune_unused_values(self, iterate, mapping_type):
+        def fn(x, cfg):
+            return x + len(cfg), tuple(cfg) if iterate else None
+
+        mapping = mapping_type(a=threading.Lock(), b=threading.Lock())
+        if mapping_type is collections.OrderedDict:
+            mapping.unused = threading.Lock()
+        inputs = {"x": torch.ones(1), "cfg": mapping}
+
+        kinds = (
+            "TYPE_MATCH",
+            "SEQUENCE_LENGTH",
+            "DICT_KEYS_MATCH",
+            "ORDERED_DICT_ORDER_MATCH",
+        )
+        check = self._roundtrip_checks(kinds, fn, inputs)
+        saved = self._saved_scope["cfg"]
+        self.assertEqual(list(saved), ["a", "b"])
+        self.assertIsInstance(saved["a"], _Missing)
+        self.assertIsInstance(saved["b"], _Missing)
+        mapping["c"] = mapping.pop("b")
+        check(inputs, False)
+
+    @parametrize(
+        "mapping_type",
+        [
+            ReduceDictionary,
+            InstanceReducedDict,
+            MetaclassReducedDict,
+            _PropertyReducedDict,
+            DescriptorReducedDict,
+            _NamespaceMetaDict,
+            NamespaceReducedDict,
+            InheritedNamespaceReducedDict,
+        ],
+    )
+    def test_dictionary_reducer_keeps_constructor_values(self, mapping_type):
+        def fn(x, cfg):
+            return x + len(cfg)
+
+        cfg = mapping_type(DictionaryToken())
+        if mapping_type in (
+            InstanceReducedDict,
+            NamespaceReducedDict,
+            InheritedNamespaceReducedDict,
+        ):
+            cfg.__reduce_ex__ = functools.partial(ClassReducedDict.__reduce_ex__, cfg)
+        x = torch.ones(1)
+        inputs = {"x": x, "cfg": cfg}
+        check = self._roundtrip_checks(("TYPE_MATCH", "SEQUENCE_LENGTH"), fn, inputs)
+        self.assertIsInstance(self._saved_scope["cfg"]["token"], DictionaryToken)
+        cfg["extra"] = None
+        check(inputs, False)
 
     def test_a_dict_subclass_keeps_its_items_when_pruned(self):
         def fn(x, cfg):
