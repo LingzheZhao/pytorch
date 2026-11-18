@@ -881,6 +881,9 @@ class InvokeSubgraphCache(HopSubgraphCache):
         self.subgraph_reuse_key_cache: dict[
             CodeType, dict[int, InvokeSubgraphReuseEntry]
         ] = defaultdict(dict)
+        # (identifier, autocast state) -> identifier emitted for calls under that
+        # state in pre-dispatch tracing.
+        self.autocast_variants: dict[tuple[str, object], str] = {}
 
     def add_dynamo_installed_submodule(
         self, fn_code: CodeType, identifier: str
@@ -901,6 +904,27 @@ class InvokeSubgraphCache(HopSubgraphCache):
 
     def get_proxy_dispatch_entry(self, identifier: str) -> Callable | None:
         return self.proxy_dispatch_cache.get(identifier, None)
+
+    def add_autocast_variant(self, identifier: str, autocast_state: object) -> str:
+        """Return the identifier to emit for a call under this autocast state.
+
+        Each (identifier, autocast state) pair gets its own identifier. It is the
+        given one if no other pair uses it yet, else the given one with an
+        "_autocast_<n>" suffix. Exported programs keep these names, so a trace
+        of one can bring in an identifier that already has such a suffix.
+        """
+        key = (identifier, autocast_state)
+        if key not in self.autocast_variants:
+            used = set(self.autocast_variants.values())
+            variant, index = identifier, 0
+            while variant in used:
+                index += 1
+                variant = f"{identifier}_autocast_{index}"
+            self.autocast_variants[key] = variant
+            # Effects are found per region, so the new identifier has the same ones.
+            if variant != identifier and (effects := self.get_effects(identifier)):
+                self.add_effects(variant, effects)
+        return self.autocast_variants[key]
 
     def add_functionalize_schema_entry(
         self, key: object, schema: torch._C.FunctionSchema

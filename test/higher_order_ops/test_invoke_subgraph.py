@@ -3280,6 +3280,35 @@ class <lambda>(torch.nn.Module):
         res = opt_fn(x)
         self.assertEqual(ref, res)
 
+    @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
+    @torch._functorch.config.patch(unlift_effect_tokens=True)
+    def test_autocast_variant_keeps_effects(self):
+        # Later passes look up the effects by the identifier on the node, so a
+        # call that gets an "_autocast_<n>" identifier needs them too.
+        from torch._functorch.aot_autograd import aot_export_module
+        from torch._guards import tracing, TracingContext
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        @nested_compile_region
+        def gn(x):
+            torch.ops.aten._print.default("effect")
+            return x.mm(x)
+
+        def fn(x):
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                a = gn(x)
+            return a, gn(x)
+
+        x = torch.randn(4, 4)
+        expected = fn(x)
+        captured = dynamo_graph_capture_for_export(fn)(x)
+        with tracing(TracingContext(FakeTensorMode(shape_env=ShapeEnv()))):
+            gm, _ = aot_export_module(
+                captured, [x], trace_joint=False, pre_dispatch=True
+            )
+        self.assertEqual(gm(x), expected)
+
 
 _reuse_test_global = None
 
@@ -5686,6 +5715,109 @@ class GraphModule(torch.nn.Module):
 
         ep = torch.export.export(M(), (x, y), strict=self.strict)
         self.assertEqual(ep.module()(x, y), M()(x, y))
+
+    @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
+    def _check_one_call_under_autocast(self, gn, make_autocast, consumer=None):
+        # A call under different autocast state must not reuse the result or
+        # the traced subgraph of the other call, in either call order, also
+        # when the program is decomposed again.
+        consumer = consumer or (lambda y, x: y)
+
+        class InsideFirst(torch.nn.Module):
+            def forward(self, x):
+                with make_autocast():
+                    a = gn(x)
+                return a, consumer(gn(x), x)
+
+        class InsideSecond(torch.nn.Module):
+            def forward(self, x):
+                a = consumer(gn(x), x)
+                with make_autocast():
+                    b = gn(x)
+                return a, b
+
+        x = torch.randn(4, 4)
+        for M in (InsideFirst, InsideSecond):
+            with self.subTest(M.__name__):
+                expected = M()(x)
+                ep = torch.export.export(M(), (x,), strict=self.strict)
+                decomposed = ep.run_decompositions()
+                for program in (ep, decomposed, decomposed.run_decompositions()):
+                    # Export can move the autocast block into a submodule.
+                    identifiers = {
+                        call.args[1]
+                        for gm in program.graph_module.modules()
+                        for call in gm.graph.find_nodes(
+                            op="call_function",
+                            target=torch.ops.higher_order.invoke_subgraph,
+                        )
+                    }
+                    self.assertEqual(len(identifiers), 2)
+                    self.assertEqual(
+                        [
+                            o.meta["val"].dtype
+                            for o in program.graph.output_node().args[0]
+                        ],
+                        [o.dtype for o in expected],
+                    )
+                    self.assertEqual(program.module()(x), expected)
+
+    def test_autocast_around_one_call_dtype_checked(self):
+        # The call outside the block feeds an op that requires matching dtypes.
+        @nested_compile_region
+        def gn(x):
+            return x.mm(x)
+
+        self._check_one_call_under_autocast(
+            gn,
+            lambda: torch.autocast("cpu", dtype=torch.bfloat16),
+            lambda y, x: torch.nn.functional.scaled_dot_product_attention(y, x, x),
+        )
+
+    def test_autocast_dtype_while_disabled(self):
+        # The bare autocast takes its dtype from the outer one, even a disabled one.
+        @nested_compile_region
+        def gn(x):
+            with torch.autocast("cpu"):
+                return x.mm(x)
+
+        self._check_one_call_under_autocast(
+            gn, lambda: torch.autocast("cpu", dtype=torch.float16, enabled=False)
+        )
+
+    @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
+    def test_autocast_reexport_keeps_identifiers_apart(self):
+        # An exported program already has "_autocast_<n>" identifiers. Tracing
+        # it again under other autocast states must not hand one of them to a
+        # call under another state.
+        @nested_compile_region
+        def gn(x):
+            return x.mm(x)
+
+        class Inner(torch.nn.Module):
+            def forward(self, x):
+                a = gn(x)
+                with torch.autocast("cpu", dtype=torch.bfloat16):
+                    b = gn(x)
+                return a, b
+
+        x = torch.randn(4, 4)
+        inner = torch.export.export(Inner(), (x,), strict=self.strict).module()
+
+        class Outer(torch.nn.Module):
+            def forward(self, x):
+                with torch.autocast("cpu", dtype=torch.float16):
+                    a = inner(x)
+                return a, inner(x)
+
+        expected = Outer()(x)
+        ep = torch.export.export(Outer(), (x,), strict=False)
+        for program in (ep, ep.run_decompositions()):
+            self.assertEqual(
+                [o.meta["val"].dtype for o in program.graph.output_node().args[0]],
+                [o.dtype for o in pytree.tree_leaves(expected)],
+            )
+            self.assertEqual(program.module()(x), expected)
 
 
 class NegativeTesting(TestCase):
