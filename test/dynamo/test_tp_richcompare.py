@@ -9,7 +9,11 @@ import torch._dynamo.test_case
 import torch._dynamo.testing
 from torch._library.opaque_object import register_custom_class
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
-from torch.testing._internal.common_utils import HardwareClassification
+from torch.testing._internal.common_utils import (
+    HardwareClassification,
+    instantiate_parametrized_tests,
+    parametrize,
+)
 
 
 class _OpaqueVal(torch._custom_class_base.CustomClassBase):
@@ -34,6 +38,7 @@ class _OpaqueVal(torch._custom_class_base.CustomClassBase):
 register_custom_class(_OpaqueVal, typ="constant", hoist=True)
 
 
+@instantiate_parametrized_tests
 class TpRichcompareTests(torch._dynamo.test_case.TestCase):
     hw_classification = HardwareClassification.GENERIC
 
@@ -1419,7 +1424,9 @@ class TpRichcompareTests(torch._dynamo.test_case.TestCase):
     # IS_OP (is / is not)
     # =====================================================================
 
-    def test_is_op(self):
+    @parametrize("receiver_kind", ["list", "list_subclass"])
+    @torch._dynamo.config.patch(nested_graph_breaks=False)
+    def test_is_op(self, receiver_kind):
         """IS_OP dispatches directly, not through COMPARE_OP's graph-break wrapper."""
         a = [1, 2, 3]
 
@@ -1428,6 +1435,21 @@ class TpRichcompareTests(torch._dynamo.test_case.TestCase):
 
         result = torch.compile(fn, backend="eager", fullgraph=True)(torch.tensor(0), a)
         self.assertEqual(result, (False, True, True))
+
+        class ListSubclass(list):
+            pass
+
+        def wrapper_fn(x, values):
+            wrapper = values.__len__
+            return x + int(wrapper is None), wrapper is not None
+
+        x = torch.ones(2)
+        values = [x] if receiver_kind == "list" else ListSubclass([x])
+        counter = torch._dynamo.testing.CompileCounter()
+        result = torch.compile(wrapper_fn, backend=counter, fullgraph=True)(x, values)
+        self.assertEqual(result, wrapper_fn(x, values))
+        self.assertGreater(counter.frame_count, 0)
+        self.assertGreater(counter.op_count, 0)
 
     # =====================================================================
     # Opaque object comparison (CustomClassObjectVariable)
