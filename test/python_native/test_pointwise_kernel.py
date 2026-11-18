@@ -65,6 +65,7 @@ class TestPointwiseKernel(TestCase):
                 cutlass.Float32,
                 [x],
                 (x.dtype,),
+                load="direct",
             )
             self.assertEqual(actual, x * 2)
 
@@ -95,6 +96,7 @@ class TestPointwiseKernel(TestCase):
                 None,
                 None,
                 None,
+                load=None,
                 out_refs=outputs,
             )
 
@@ -350,6 +352,7 @@ class TestPointwiseKernel(TestCase):
             torch2cute[compute],
             (value,),
             (compute,),
+            load="direct",
             vec_bits=vec_bits,
         )
         with torch.backends.python_native.cutedsl.disabled():
@@ -389,6 +392,7 @@ class TestPointwiseKernel(TestCase):
                 torch2cute[compute],
                 [x],
                 (dtype,),
+                load="direct",
             )
             self.assertEqual(actual.dtype, dtype)
             self.assertEqual(actual, expected, atol=0, rtol=0)
@@ -431,6 +435,7 @@ class TestPointwiseKernel(TestCase):
                         (x.dtype,),
                         out=[out],
                         ept=ept,
+                        load="direct",
                     )
                     self.assertIs(actual, out)
                     self.assertEqual(out.stride(), strides)
@@ -467,6 +472,7 @@ class TestPointwiseKernel(TestCase):
             ct,
             [x, scalar],
             (x.dtype,),
+            load="direct",
         )
         with torch.backends.python_native.cutedsl.disabled():
             self.assertEqual(actual, expected, atol=0, rtol=0)
@@ -571,6 +577,7 @@ class TestPointwiseKernel(TestCase):
                     [x, y],
                     (torch.float32,),
                     out=[out],
+                    load="direct",
                 )
                 self.assertIs(actual, out)
                 self.assertEqual(actual, expected)
@@ -606,6 +613,7 @@ class TestPointwiseKernel(TestCase):
             torch2cute[a.dtype],
             [a, b],
             (a.dtype,),
+            load="direct",
         )
         with torch.backends.python_native.cutedsl.disabled():
             self.assertEqual(actual, expected, atol=0, rtol=0)
@@ -646,6 +654,7 @@ class TestPointwiseKernel(TestCase):
             torch2cute[dtype],
             [x, y],
             (dtype,),
+            load="direct",
         )
         with torch.backends.python_native.cutedsl.disabled():
             self.assertEqual(actual, expected)
