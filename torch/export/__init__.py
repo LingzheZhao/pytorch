@@ -391,7 +391,10 @@ def load(
     This is not a safety guarantee: as the warning above says, load unpickles
     data, and other parts of the file, such as the specs of the program's
     inputs and outputs or the inputs of other higher order ops, can import
-    modules too.
+    modules too. A program can also import a module when it runs: a node that
+    calls ``torch.export.custom_ops._call_custom_autograd_function_in_pre_dispatch``
+    directly, instead of through ``flat_apply``, imports the module that the
+    file names as its first input. Export itself never writes such a node.
 
     Args:
         f (str | os.PathLike[str] | IO[bytes]): A file-like object (has to
