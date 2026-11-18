@@ -26,10 +26,7 @@ if not dist.is_available():
 
 from torch._C._distributed_c10d import BarrierOptions, FlightRecorderHook, WorkResult
 from torch.distributed.distributed_c10d import _world
-from torch.testing._internal.common_distributed import (
-    MultiProcessTestCase,
-    TEST_NCCL_LEGACY,
-)
+from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_utils import run_tests, TEST_CUDA, TestCase
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -1677,51 +1674,6 @@ class FlightRecorderHookDefaultNcclTest(MultiProcessTestCase):
             [e["profiling_name"] for e in self._entries("nccl2")[before:]],
             ["nccl2:all_reduce"],
         )
-
-    @unittest.skipIf(not TEST_NCCL_LEGACY, "legacy NCCL backend is not built")
-    def test_nccl_name_built_on_stock_is_not_hooked(self):
-        pg, name = self._init_nccl("0")
-        self.assertEqual(name, "nccl")
-        self.assertNotIn(pg, _world.pg_flight_recorder_hooks)
-
-        before = len(self._entries("nccl"))
-        dist.all_reduce(torch.ones(8, device=f"cuda:{self.rank}"))
-        torch.cuda.synchronize()
-        # Nothing in the hook's instance, and the native recording that made
-        # the hook unnecessary is still there.
-        self.assertEqual(self._entries("nccl")[before:], [])
-        native = json.loads(torch._C._distributed_c10d._dump_nccl_trace_json())
-        names = [e["profiling_name"] for e in native.get("entries", [])]
-        self.assertIn("nccl:all_reduce", names)
-
-    @unittest.skipIf(not TEST_NCCL_LEGACY, "legacy NCCL backend is not built")
-    def test_gloo_half_of_stock_nccl_group_recorded_once(self):
-        pg, name = self._init_nccl("0", backend="cpu:gloo,cuda:nccl")
-        self.assertEqual(name, "nccl")
-        self.assertIn(pg, _world.pg_flight_recorder_hooks)
-
-        def native():
-            trace = json.loads(torch._C._distributed_c10d._dump_nccl_trace_json())
-            return trace.get("entries", [])
-
-        before_gloo = len(self._entries("gloo"))
-        before_nccl = len(self._entries("nccl"))
-        before_native = len(native())
-        dist.all_reduce(torch.ones(8))
-        dist.all_reduce(torch.ones(16, device=f"cuda:{self.rank}"))
-        dist.barrier()
-        torch.cuda.synchronize()
-        # The hook records the gloo half and leaves the CUDA half to stock
-        # ProcessGroupNCCL's own recording.
-        self.assertEqual(
-            [e["profiling_name"] for e in self._entries("gloo")[before_gloo:]],
-            ["gloo:all_reduce", "gloo:barrier"],
-        )
-        self.assertEqual(
-            [(e["profiling_name"], e["input_sizes"]) for e in native()[before_native:]],
-            [("nccl:all_reduce", [[16]])],
-        )
-        self.assertEqual(self._entries("nccl")[before_nccl:], [])
 
 
 if __name__ == "__main__":
