@@ -31,6 +31,7 @@ import torch
 # imported module.
 import torch._dynamo._trace_wrapped_higher_order_op
 import torch.export.exported_program as ep
+from torch._dynamo.utils import get_unique_name_wrt
 from torch._export.non_strict_utils import _enable_graph_inputs_of_type_nn_module
 from torch._export.verifier import load_verifier
 from torch._export.wrappers import _is_allowed_in_pre_dispatch_graph
@@ -865,7 +866,27 @@ def _same_value(a: Any, b: Any) -> bool:
         )
     if isinstance(a, (list, tuple)):
         return len(a) == len(b) and all(map(_same_value, a, b))
+    if isinstance(a, (set, frozenset)):
+        return len(a) == len(b) and all(any(_same_value(x, y) for y in b) for x in a)
+    # JSON loads NaN back as NaN, which does not equal itself, but drops its
+    # sign, which math.copysign reads.
+    if isinstance(a, float) and math.isnan(a):
+        return math.isnan(b) and math.copysign(1.0, a) == math.copysign(1.0, b)
     return a == b
+
+
+def _contains_nan(value: Any) -> bool:
+    if isinstance(value, (list, tuple)):
+        return any(map(_contains_nan, value))
+    return isinstance(value, float) and math.isnan(value)
+
+
+def _same_spec_node(t1: Any, c1: Any, t2: Any, c2: Any) -> bool:
+    # JSON loads every NaN as one shared object, so NaN dict keys would merge,
+    # and the function's own NaN key would not find its value.
+    if isinstance(t1, type) and issubclass(t1, dict) and _contains_nan(c1):
+        return False
+    return t1 is t2 and _same_value(c1, c2)
 
 
 def _find_flat_apply_func(
@@ -1558,15 +1579,11 @@ class GraphModuleSerializer(metaclass=Final):
                 f"Cannot serialize flat_apply node {node.name}: its input spec "
                 f"cannot be saved: {e}"
             ) from e
-        if not is_equivalent(
-            loaded_spec,
-            in_spec_value,
-            lambda t1, c1, t2, c2: t1 is t2 and _same_value(c1, c2),
-        ):
+        if not is_equivalent(loaded_spec, in_spec_value, _same_spec_node):
             raise SerializeError(
                 f"Cannot serialize flat_apply node {node.name}: its input spec "
                 "would load back different, because JSON cannot store a part of "
-                "it, such as a tuple or an int subclass used as a dict key"
+                "it, such as a tuple, an int subclass or a NaN used as a dict key"
             )
         try:
             constant_func = pytree._retrieve_constant(func_spec).func
@@ -3508,16 +3525,24 @@ class GraphModuleDeserializer(metaclass=Final):
         _check_operator_inputs(where, flat_inputs, args)
         func = _find_flat_apply_func(func_name, in_spec, args)
         specs = {"func_spec": func_to_graphable(func)[1], "in_spec": in_spec}
+        # module() adds parameters, buffers and constants as attributes after
+        # load, under the first part of their names.
+        state_names = {
+            input_spec.target.split(".")[0]
+            for input_spec in self.signature.input_specs
+            if input_spec.target is not None
+        }
         spec_nodes = []
         for suffix, spec in specs.items():
-            attr_name = f"{serialized_node.name}_{suffix}"
-            # A repeated name would let a later node replace specs that were
-            # already checked.
-            if hasattr(self.module, attr_name):
-                raise SerializeError(
-                    f"{where} needs the attribute name {attr_name}, which another "
-                    "node already uses"
-                )
+            # A unique name also keeps a node with a repeated name from
+            # replacing the specs of another node, which were already checked.
+            # Later nodes take the names of the values they define.
+            attr_name = get_unique_name_wrt(
+                f"{serialized_node.name}_{suffix}",
+                dir(self.module),
+                state_names,
+                self.serialized_name_to_meta.map,
+            )
             setattr(self.module, attr_name, spec)
             spec_nodes.append(
                 self.graph.create_node("get_attr", attr_name, name=attr_name)
