@@ -1,9 +1,11 @@
 # Owner(s): ["module: dynamo"]
 
 import enum
+import itertools
 import sys
 import types
 import unittest
+from collections import deque, OrderedDict
 
 import torch
 import torch._dynamo.test_case
@@ -137,6 +139,117 @@ class TestIterators(torch._dynamo.test_case.TestCase):
     def tearDown(self):
         super().tearDown()
         torch._dynamo.config.enable_trace_unittest = self._u_prev
+
+    @parametrize("created", [False, True])
+    def test_iterable_attribute_error_metadata(self, created):
+        def fn(x, iterator):
+            obj = zip([1], [2]) if created else next(iterator)
+            missing = hasattr(obj, "missing")
+            try:
+                obj.missing
+            except AttributeError as error:
+                return x + 1, missing, error.name, error.obj is obj
+
+        x = torch.ones(1)
+        self.assertEqual(
+            torch.compile(fn, backend="eager", fullgraph=True)(
+                x, iter((bytearray(b"a"),))
+            ),
+            (x + 1, False, "missing", True),
+        )
+
+    @parametrize("name", ["__name__", "__qualname__", "__mro__", "mro", "missing"])
+    def test_iterator_missing_instance_attribute(self, name):
+        def fn(x):
+            iterator = zip([1], [2])
+            return x + 1, hasattr(iterator, name)
+
+        x = torch.ones(1)
+        self.assertEqual(fn(x), (x + 1, False))
+        self.assertEqual(torch.compile(fn, backend="eager", fullgraph=True)(x), fn(x))
+
+    @parametrize("method", ["__getattr__", "__getattribute__"])
+    def test_slotted_iterable_custom_attribute(self, method):
+        class Iterable:
+            __slots__ = ()
+
+            def __iter__(self):
+                return iter((1,))
+
+            def get_attribute(self, name):
+                if name == "missing":
+                    return 7
+                return object.__getattribute__(self, name)
+
+            if method == "__getattr__":
+                __getattr__ = get_attribute
+            else:
+                __getattribute__ = get_attribute
+
+        def fn(x, obj):
+            return x + obj.missing, hasattr(obj, "missing")
+
+        x, obj = torch.ones(1), Iterable()
+        self.assertEqual(
+            torch.compile(fn, backend="eager", fullgraph=True)(x, obj), fn(x, obj)
+        )
+
+    @parametrize(
+        "factory, args",
+        [
+            (bytearray, ()),
+            (itertools.chain, ()),
+            (itertools.count, ()),
+            (itertools.repeat, (1,)),
+            (deque, ()),
+            (torch.Size, ([],)),
+        ],
+    )
+    @parametrize("call_method", [False, True])
+    def test_builtin_iterable_missing_attribute_message(
+        self, factory, args, call_method
+    ):
+        def fn(x):
+            obj = factory(*args)
+            try:
+                if call_method:
+                    obj.sort()
+                else:
+                    obj.missing
+            except AttributeError as exc:
+                return x + 1, str(exc)
+
+        x = torch.ones(1)
+        self.assertEqual(torch.compile(fn, backend="eager", fullgraph=True)(x), fn(x))
+
+    @parametrize("kind", ["dict", "values", "items", "ordered", "set"])
+    def test_escaped_iterator_attribute_error(self, kind):
+        def fn(x, owner):
+            if kind == "values":
+                iterator = iter(owner.values())
+            elif kind == "items":
+                iterator = iter(owner.items())
+            else:
+                iterator = iter(owner)
+            try:
+                iterator.missing
+            except AttributeError as error:
+                return x + 1, iterator, error
+
+        owner = {1, 2} if kind == "set" else {1: 10, 2: 20}
+        if kind == "ordered":
+            owner = OrderedDict(owner)
+        x = torch.ones(1)
+        compiled = torch.compile(fn, backend="eager", fullgraph=True)
+        result, iterator, error = compiled(x, owner)
+        self.assertEqual(result, x + 1)
+        self.assertIs(type(iterator), type(fn(x, owner)[1]))
+        self.assertEqual(error.name, "missing")
+        self.assertIs(error.obj, iterator)
+        owner.clear()
+        reason = "mutated" if kind == "ordered" else "changed size"
+        with self.assertRaisesRegex(RuntimeError, f"{reason} during iteration"):
+            next(iterator)
 
     @make_dynamo_test
     def test_list_iteration(self):
