@@ -3659,13 +3659,13 @@ class DictBuiltinVariable(BaseBuiltinVariable):
             obj = args[0].realize()
             if isinstance(obj, ConstDictVariable):
                 obj.check_base_dict_mutation(tx, name)
-            if name == "__repr__":
+            if name in (*_RICH_CMP_DUNDERS, "__repr__", "__iter__"):
                 if not isinstance(obj, ConstDictVariable):
                     unimplemented(
                         gb_type="Unsupported builtin dictionary storage operation",
                         context=f"dict.{name} on {obj.python_type_name()}",
                         explanation="Dynamo cannot yet preserve builtin dictionary storage for this operation.",
-                        hints=[],
+                        hints=[*graph_break_hints.SUPPORTABLE],
                     )
                 # Explicit dict slots bypass OrderedDict's linked-order behavior.
                 slotdef = obj.lookup_slotdefs(name)
